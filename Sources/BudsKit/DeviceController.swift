@@ -69,6 +69,12 @@ public final class DeviceController {
         frameTask?.cancel(); frameTask = nil
         batteryTask?.cancel(); batteryTask = nil
         inFlight?.cancel(); inFlight = nil
+        // Dropping the reference only. Neither GaiaClient.write nor
+        // FakeTransport.write checks Task.isCancelled, so cancelling the write
+        // chain cannot abort a GATT write already queued behind an earlier one.
+        // What actually prevents a late write from mutating state or publishing
+        // after stop() is the !Task.isCancelled guard in performSet, made true
+        // by inFlight?.cancel() above — not by this call.
         writeOrder?.cancel(); writeOrder = nil
     }
 
