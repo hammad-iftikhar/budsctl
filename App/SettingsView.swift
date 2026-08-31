@@ -106,8 +106,14 @@ struct SettingsView: View {
         }
         .task(id: model.controller.state.connection) {
             model.refreshDevices()
-            isSyncingToggle = true
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            // Only arm the guard when this will actually change the value —
+            // onChange fires only on a real change, so arming it for a no-op
+            // write would leave it stuck and swallow the user's next real tap.
+            let actual = SMAppService.mainApp.status == .enabled
+            if actual != launchAtLogin {
+                isSyncingToggle = true
+                launchAtLogin = actual
+            }
         }
     }
 
@@ -121,8 +127,11 @@ struct SettingsView: View {
             registrationError = nil
         } catch {
             registrationError = error.localizedDescription
-            isSyncingToggle = true
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            let actual = SMAppService.mainApp.status == .enabled
+            if actual != launchAtLogin {
+                isSyncingToggle = true
+                launchAtLogin = actual
+            }
         }
         // `requiresApproval` means macOS is waiting on the user in
         // System Settings > General > Login Items. Say so rather than
