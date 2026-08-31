@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.hammadiftikhar.budsctl.cli</string>
+	<key>CFBundleName</key>
+	<string>budsctl-cli</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>budsctl-cli connects to your earbuds to read and change noise cancellation modes.</string>
+</dict>
+</plist>
