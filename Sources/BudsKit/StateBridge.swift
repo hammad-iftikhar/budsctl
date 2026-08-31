@@ -61,9 +61,10 @@ public final class StateBridge: @unchecked Sendable {
 
     // MARK: - Requests, extension to agent
 
-    public func postRequest(_ request: BridgeRequest) {
-        guard let data = try? JSONEncoder().encode(request) else { return }
+    @discardableResult
+    public func postRequest(_ request: BridgeRequest) -> Int {
         let seq = defaults.integer(forKey: Key.requestSeq) + 1
+        guard let data = try? JSONEncoder().encode(request) else { return seq - 1 }
         defaults.set(data, forKey: Key.request)
         defaults.set(seq, forKey: Key.requestSeq)
         // ponytail: no synchronize() call. Darwin delivery is slower than the
@@ -76,6 +77,27 @@ public final class StateBridge: @unchecked Sendable {
             nil,
             true
         )
+        return seq
+    }
+
+    /// Highest seq the agent has taken. Used to tell "the agent handled it"
+    /// from "nothing is running".
+    public var handledSeq: Int {
+        defaults.integer(forKey: Key.handledSeq)
+    }
+
+    /// Poll until the agent takes `seq`, or give up.
+    ///
+    /// Polling rather than a second Darwin notification: this runs inside a
+    /// control extension with a short execution budget, and a 100 ms defaults
+    /// read is cheaper than standing up an observer for one shot.
+    public func waitForHandling(of seq: Int, timeout: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if handledSeq >= seq { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return handledSeq >= seq
     }
 
     /// Returns the pending request, or nil if there is none or it was already

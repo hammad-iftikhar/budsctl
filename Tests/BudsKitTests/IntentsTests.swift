@@ -10,6 +10,15 @@ struct IntentsTests {
         return StateBridge(defaults: UserDefaults(suiteName: suite)!)
     }
 
+    /// A reference box for handing a value out of a detached `Task` closure.
+    /// `perform()` now waits on the bridge for up to 2 seconds before falling
+    /// back to launching the app, so these tests simulate an already-running
+    /// agent draining the request while `perform()` waits.
+    private final class Box<Value>: @unchecked Sendable {
+        var value: Value
+        init(_ value: Value) { self.value = value }
+    }
+
     @Test("every ANCMode round trips through the intent enum")
     func enumRoundTrip() {
         for mode in ANCMode.allCases {
@@ -32,8 +41,13 @@ struct IntentsTests {
         var intent = SetModeIntent()
         intent.mode = .transparency
         intent.injectedBridge = bridge
+        let taken = Box<BridgeRequest?>(nil)
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            taken.value = bridge.takeRequest()
+        }
         _ = try await intent.perform()
-        #expect(bridge.takeRequest() == .setMode(.passthrough))
+        #expect(taken.value == .setMode(.passthrough))
         #expect(bridge.takeRequest() == nil)
     }
 
@@ -42,8 +56,13 @@ struct IntentsTests {
         let bridge = scratchBridge()
         var intent = CycleModeIntent()
         intent.injectedBridge = bridge
+        let taken = Box<BridgeRequest?>(nil)
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            taken.value = bridge.takeRequest()
+        }
         _ = try await intent.perform()
-        #expect(bridge.takeRequest() == .cycleMode)
+        #expect(taken.value == .cycleMode)
     }
 
     @Test("a get intent reads the published snapshot and posts nothing")

@@ -36,6 +36,12 @@ public enum ANCModeAppEnum: String, AppEnum {
     }
 }
 
+/// Neither this intent nor `CycleModeIntent` conforms to `ForegroundContinuableIntent`:
+/// on the macOS 26.5 SDK that protocol, and `requestToContinueInForeground()`, are
+/// deprecated in favor of `AppIntent.continueInForeground(_:alwaysConfirm:)`, which
+/// is available on every `AppIntent` with no protocol conformance needed. Using the
+/// deprecated pair here would build clean today but leave a warning-free build
+/// commitment resting on soon-to-be-removed API for no behavioral difference.
 public struct SetModeIntent: AppIntent {
     public static let title: LocalizedStringResource = "Set Noise Mode"
     public static let description = IntentDescription("Set the earbuds' noise mode.")
@@ -52,8 +58,15 @@ public struct SetModeIntent: AppIntent {
     public init() {}
 
     public func perform() async throws -> some IntentResult & ProvidesDialog {
-        bridge.postRequest(.setMode(mode.asANCMode))
-        return .result(dialog: IntentDialog("Set to \(mode.asANCMode.label)"))
+        let seq = bridge.postRequest(.setMode(mode.asANCMode))
+        if await bridge.waitForHandling(of: seq, timeout: .seconds(2)) {
+            return .result(dialog: IntentDialog("Set to \(mode.asANCMode.label)"))
+        }
+        // Nothing picked the request up, so the agent is not running. Launch
+        // it — it drains pending requests on start, so the original request
+        // still applies and must not be re-posted.
+        try await continueInForeground()
+        return .result(dialog: IntentDialog("Starting BudsCtl…"))
     }
 }
 
@@ -70,7 +83,11 @@ public struct CycleModeIntent: AppIntent {
     public init() {}
 
     public func perform() async throws -> some IntentResult {
-        bridge.postRequest(.cycleMode)
+        let seq = bridge.postRequest(.cycleMode)
+        if await bridge.waitForHandling(of: seq, timeout: .seconds(2)) {
+            return .result()
+        }
+        try await continueInForeground()
         return .result()
     }
 }

@@ -82,4 +82,41 @@ struct StateBridgeTests {
             #expect(try JSONDecoder().decode(BridgeRequest.self, from: data) == request)
         }
     }
+
+    @Test("postRequest returns a monotonically increasing seq")
+    func seqIncreases() {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        let first = bridge.postRequest(.cycleMode)
+        let second = bridge.postRequest(.cycleMode)
+        #expect(second == first + 1)
+    }
+
+    @Test("handledSeq advances only when a request is taken")
+    func handledSeqTracking() {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        let seq = bridge.postRequest(.setMode(.anc))
+        #expect(bridge.handledSeq < seq)
+        _ = bridge.takeRequest()
+        #expect(bridge.handledSeq == seq)
+    }
+
+    @Test("waitForHandling returns false when nobody is listening")
+    func waitForHandlingTimesOut() async {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        let seq = bridge.postRequest(.cycleMode)
+        // This is the "agent is not running" signal the intent uses to decide
+        // whether to launch the app.
+        #expect(await bridge.waitForHandling(of: seq, timeout: .milliseconds(200)) == false)
+    }
+
+    @Test("waitForHandling returns true once the agent takes the request")
+    func waitForHandlingSucceeds() async {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        let seq = bridge.postRequest(.cycleMode)
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            _ = bridge.takeRequest()
+        }
+        #expect(await bridge.waitForHandling(of: seq, timeout: .seconds(2)) == true)
+    }
 }

@@ -1,9 +1,12 @@
 import SwiftUI
+import ServiceManagement
 import BudsKit
 
 struct SettingsView: View {
     let model: AppModel
     @State private var showAll = false
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var registrationError: String?
 
     private var selected: UUID? { model.bridge.peripheralIdentifier }
 
@@ -71,9 +74,50 @@ struct SettingsView: View {
                 }
             }
             .font(.caption)
+
+            Divider()
+
+            Text("GENERAL")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Toggle("Launch at login", isOn: $launchAtLogin)
+                .toggleStyle(.checkbox)
+                .font(.callout)
+                .onChange(of: launchAtLogin) { _, wanted in
+                    apply(wanted)
+                }
+
+            if let registrationError {
+                Text(registrationError)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .task(id: model.controller.state.connection) {
             model.refreshDevices()
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+    }
+
+    private func apply(_ wanted: Bool) {
+        do {
+            if wanted {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            registrationError = nil
+        } catch {
+            registrationError = error.localizedDescription
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+        // `requiresApproval` means macOS is waiting on the user in
+        // System Settings > General > Login Items. Say so rather than
+        // silently showing the toggle in the wrong position.
+        if wanted, SMAppService.mainApp.status == .requiresApproval {
+            registrationError = "Approve BudsCtl in System Settings ▸ General ▸ Login Items."
         }
     }
 }
