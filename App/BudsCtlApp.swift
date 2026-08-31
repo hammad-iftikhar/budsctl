@@ -59,6 +59,16 @@ final class AppModel {
         KeyboardShortcuts.onKeyUp(for: .cycleMode) { [weak self] in
             self?.controller.cycleMode()
         }
+
+        // The link usually survives sleep, but the state may be stale — the
+        // user could have changed mode from their phone while the Mac slept.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.controller.refreshOnWake() }
+        }
     }
 
     func drainRequests() {

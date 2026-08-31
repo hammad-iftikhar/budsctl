@@ -20,6 +20,15 @@ struct PanelView: View {
                 batteryRow
             }
 
+            if state.connection == .bluetoothOff {
+                Button("Open Bluetooth Settings") {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.Bluetooth") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .font(.callout)
+            }
+
             if let error = state.lastError {
                 Text(error)
                     .font(.caption)

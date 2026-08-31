@@ -242,4 +242,44 @@ struct DeviceControllerTests {
         #expect(bridge.readSnapshot().connected == false)
         controller.stop()
     }
+
+    @Test("a write refused while connected reads as another device holding the buds")
+    func inUseByAnotherDevice() async throws {
+        let (controller, transport, _) = makeController()
+        controller.state.connection = .ready
+        transport.failWrites = true
+        controller.setMode(.anc)
+        try await until("error surfaced") { controller.state.lastError != nil }
+        // The buds are reachable but the write was refused — almost always
+        // because they are actively in use by a phone.
+        #expect(controller.state.lastError == "In use by another device")
+        controller.stop()
+    }
+
+    @Test("a write that fails with no link reads as disconnected")
+    func writeWithNoLink() async throws {
+        let (controller, transport, _) = makeController()
+        controller.state.connection = .waiting
+        transport.failWrites = true
+        controller.setMode(.anc)
+        try await until("error surfaced") { controller.state.lastError != nil }
+        #expect(controller.state.lastError == "Earbuds not connected")
+        controller.stop()
+    }
+
+    @Test("wake refresh re-reads mode and battery, and does nothing when not ready")
+    func wakeRefresh() async throws {
+        let (controller, transport, _) = makeController(mode: .anc)
+        await controller.refreshOnWake()
+        let commands = transport.recordedWrites().map(\.0)
+        #expect(commands.contains(.getMode))
+        #expect(commands.contains(.getBatteryLeft))
+        #expect(commands.contains(.setMode) == false)
+
+        let (idle, idleTransport, _) = makeController()
+        idle.state.connection = .waiting
+        await idle.refreshOnWake()
+        #expect(idleTransport.recordedWrites().isEmpty)
+        controller.stop(); idle.stop()
+    }
 }

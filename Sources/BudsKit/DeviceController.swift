@@ -69,6 +69,7 @@ public final class DeviceController {
         frameTask?.cancel(); frameTask = nil
         batteryTask?.cancel(); batteryTask = nil
         inFlight?.cancel(); inFlight = nil
+        writeOrder?.cancel(); writeOrder = nil
     }
 
     // MARK: - Inbound frames
@@ -155,8 +156,17 @@ public final class DeviceController {
         writeOrder = thisWrite
 
         guard await thisWrite.value else {
+            // Stopped, or superseded and the controller torn down, while this
+            // write was queued behind an earlier one: do not mutate state or
+            // publish after being told to stop.
+            guard !Task.isCancelled else { return }
             if state.pendingMode == target { state.pendingMode = nil }
-            state.lastError = "Could not reach the earbuds"
+            // A refused write on a live link almost always means the buds are
+            // busy with a phone. Retrying is pointless; the next unsolicited
+            // notification will reconcile us.
+            state.lastError = state.connection.isReady
+                ? "In use by another device"
+                : "Earbuds not connected"
             publish()
             return
         }
