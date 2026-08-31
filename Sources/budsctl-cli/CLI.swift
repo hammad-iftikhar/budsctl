@@ -14,52 +14,46 @@ import BudsKit
 final class Runner {
     let bridge = StateBridge(defaults: .standard)
     lazy var client = GaiaClient(bridge: bridge)
-    private var readyContinuation: CheckedContinuation<Void, Error>?
 
+    // withTimeout races the operation against a sleep inside a task group, and
+    // a task group drains all its children even after cancelAll() — cancelling
+    // a task parked on a raw CheckedContinuation does not resume it. So the
+    // continuation-based version of this function could never actually time
+    // out. An AsyncStream, like every other wait in this codebase, returns
+    // correctly at the timeout boundary because `for await` responds to
+    // cancellation cooperatively.
+    //
+    // The 20 s default is deliberate (see the plan): during the case-lid exit
+    // test, this is exactly how long the human has to open the case and pull
+    // a bud out before `set`/`status`/`watch` give up and report a timeout.
     func waitForReady(timeout: Duration = .seconds(20)) async throws {
-        client.onConnectionChange = { [weak self] state in
+        let (states, continuation) = AsyncStream<ConnectionState>.makeStream()
+        client.onConnectionChange = { state in
             print("[connection] \(state.label)")
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.readyContinuation?.resume()
-                self.readyContinuation = nil
-            case .notConfigured:
-                self.readyContinuation?.resume(
-                    throwing: CLIError.message("No device saved. Run `budsctl-cli discover` first.")
-                )
-                self.readyContinuation = nil
-            case .failed(let reason):
-                self.readyContinuation?.resume(throwing: CLIError.message(reason))
-                self.readyContinuation = nil
-            case .bluetoothOff:
-                self.readyContinuation?.resume(throwing: CLIError.message("Bluetooth is off."))
-                self.readyContinuation = nil
-            case .waiting, .connecting:
-                break   // pending connect: this is the case-lid dance we are testing away
-            }
+            continuation.yield(state)
         }
+        defer { continuation.finish() }
         client.start()
 
-        let result = await withTimeout(timeout) { @MainActor [weak self] () -> Bool in
-            guard let self else { return false }
-            do {
-                try await withCheckedThrowingContinuation { continuation in
-                    self.readyContinuation = continuation
+        let outcome = await withTimeout(timeout) { () -> Result<Void, CLIError> in
+            for await state in states {
+                switch state {
+                case .ready:                return .success(())
+                case .notConfigured:        return .failure(.message("No device saved. Run `budsctl-cli discover` first."))
+                case .bluetoothOff:         return .failure(.message("Bluetooth is off."))
+                case .failed(let reason):   return .failure(.message(reason))
+                // A pending connect is the reconnect mechanism, not a failure.
+                case .waiting, .connecting: continue
                 }
-                return true
-            } catch {
-                print("error: \(error)")
-                return false
             }
-        }
-        guard result == true else {
-            throw CLIError.message("Never became ready. Are the buds out of the case and in range?")
-        }
+            return .failure(.message("The connection stream ended before the earbuds were ready."))
+        } ?? .failure(.message("Never became ready in \(timeout). Are the buds out of the case and in range?"))
+
+        if case .failure(let error) = outcome { throw error }
     }
 }
 
-enum CLIError: Error { case message(String) }
+enum CLIError: Error, Sendable { case message(String) }
 
 func usage() -> Never {
     print("""
@@ -170,7 +164,9 @@ struct CLI {
 
         if confirmed {
             let elapsed = ContinuousClock.now - started
-            print("confirmed \(target.label) after \(elapsed)")
+            let components = elapsed.components
+            let milliseconds = components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000
+            print("confirmed \(target.label) after \(milliseconds) ms")
         } else {
             print("no confirmation in 5 s; polling the getter…")
             let actual = try await runner.client.request(.getMode)
