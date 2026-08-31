@@ -34,12 +34,15 @@ public final class StateBridge: @unchecked Sendable {
         self.defaults = defaults
     }
 
-    /// False when the App Group suite could not be opened — i.e. the
-    /// entitlement is missing or unprovisioned. Surface it, do not paper over
-    /// it: silently falling back to `.standard` would make the extension and
-    /// the agent read two different stores and look merely "broken".
+    /// False when the App Group is not actually provisioned for this build —
+    /// i.e. the entitlement is missing or the signing team cannot grant it.
+    /// Surface it, do not paper over it: `UserDefaults(suiteName:)` succeeds
+    /// regardless, so an unprovisioned group would silently give the agent and
+    /// the extension two different stores and look merely "broken".
     public var appGroupAvailable: Bool {
-        UserDefaults(suiteName: BudsCtl.appGroupID) != nil
+        FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: BudsCtl.appGroupID
+        ) != nil
     }
 
     // MARK: - State, agent to extension
