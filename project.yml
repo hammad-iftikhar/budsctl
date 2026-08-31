@@ -1,0 +1,78 @@
+name: BudsCtl
+
+options:
+  bundleIdPrefix: com.hammadiftikhar
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: JCXZ7458UT
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    DEAD_CODE_STRIPPING: YES
+
+packages:
+  BudsKit:
+    path: .
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    from: 2.3.0
+
+targets:
+
+  BudsCtl:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    dependencies:
+      - package: BudsKit
+        product: BudsKit
+      - package: KeyboardShortcuts
+      - target: BudsCtlControls
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hammadiftikhar.budsctl
+        PRODUCT_NAME: BudsCtl
+        CODE_SIGN_ENTITLEMENTS: App/BudsCtl.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        COMBINE_HIDPI_IMAGES: YES
+    info:
+      path: App/Info.plist
+      properties:
+        # Menu bar only, no Dock icon, no main window.
+        LSUIElement: true
+        # Mandatory. Without it CoreBluetooth is denied, sometimes silently.
+        NSBluetoothAlwaysUsageDescription: >-
+          BudsCtl connects to your earbuds to change noise cancellation modes.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+
+  BudsCtlControls:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Controls
+    dependencies:
+      - package: BudsKit
+        product: BudsKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hammadiftikhar.budsctl.controls
+        PRODUCT_NAME: BudsCtlControls
+        CODE_SIGN_ENTITLEMENTS: Controls/BudsCtlControls.entitlements
+    info:
+      path: Controls/Info.plist
+      properties:
+        CFBundleDisplayName: BudsCtl Controls
+        NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)

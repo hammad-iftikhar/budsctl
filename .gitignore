@@ -5,3 +5,5 @@ docs/*
 *.xcworkspace
 xcuserdata/
 DerivedData/
+App/Info.plist
+Controls/Info.plist
