@@ -19,6 +19,11 @@ public final class DeviceController {
     private var frameTask: Task<Void, Never>?
     private var batteryTask: Task<Void, Never>?
     private var inFlight: Task<Void, Never>?
+    /// Serializes only the write step of successive `setMode` calls, so a
+    /// superseded click's write cannot land after a newer one's. See
+    /// `performSet` for why this is not the same thing as the queue that was
+    /// reverted from `setMode`.
+    private var writeOrder: Task<Bool, Never>?
 
     /// How long to wait for the device's unsolicited confirmation.
     public var setTimeout: Duration = .seconds(3)
@@ -104,20 +109,11 @@ public final class DeviceController {
     // MARK: - Actions
 
     /// Fire and forget. Returns immediately with the UI already showing the
-    /// newest target, and coalesces: the newest target owns the displayed state
-    /// until it settles.
-    ///
-    /// Sets are queued behind one another rather than cancelling one another.
-    /// Every click must reach the device — dropping one strands it on an
-    /// intermediate mode — and two sets written back to back can be applied and
-    /// confirmed out of order, which would leave the device on an older target.
+    /// target, and coalesces: a newer target cancels the older wait.
     public func setMode(_ target: ANCMode) {
-        let previous = inFlight
+        inFlight?.cancel()
         state.pendingMode = target
-        inFlight = Task { [weak self] in
-            _ = await previous?.value
-            await self?.performSet(target)
-        }
+        inFlight = Task { [weak self] in await self?.performSet(target) }
     }
 
     public func cycleMode() {
@@ -138,9 +134,27 @@ public final class DeviceController {
         // arrive before a later-started listener would exist.
         let stream = transport.frames()
 
-        do {
-            try await transport.write(.setMode, payload: [target.rawValue])
-        } catch {
+        // The write itself is chained onto the previous write, not onto the
+        // previous *wait*: `transport.write` is a fast, synchronous hand-off,
+        // so this adds no perceptible latency, but it guarantees writes reach
+        // the transport in the order they were issued. Without it, this
+        // task's write and a click that supersedes it race on the concurrent
+        // executor and can land out of order — cancelling `inFlight` above
+        // only cancels the (potentially seconds-long) confirmation wait
+        // below, on purpose, so the write must not depend on it either.
+        let previousWrite = writeOrder
+        let thisWrite = Task { [transport] in
+            _ = await previousWrite?.value
+            do {
+                try await transport.write(.setMode, payload: [target.rawValue])
+                return true
+            } catch {
+                return false
+            }
+        }
+        writeOrder = thisWrite
+
+        guard await thisWrite.value else {
             if state.pendingMode == target { state.pendingMode = nil }
             state.lastError = "Could not reach the earbuds"
             publish()

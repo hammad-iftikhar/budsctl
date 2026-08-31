@@ -15,6 +15,13 @@ final class FakeTransport: GaiaTransport, @unchecked Sendable {
     private var _writes: [(GaiaCommand, [UInt8])] = []
     private var currentMode: ANCMode
     private let applyDelay: Duration
+    /// Chains successive setMode confirmations so they are emitted in the
+    /// order their writes were received, matching real firmware (which
+    /// processes GATT writes serially). Each delayed emission is its own
+    /// unstructured `Task`, so without this a slow click's confirmation can
+    /// otherwise be reordered ahead of a later click's by scheduler jitter —
+    /// a fake-only artifact a real single-threaded device would never show.
+    private var pendingConfirmation: Task<Void, Never>?
 
     /// Make every write throw, to exercise the write-failure path.
     var failWrites = false
@@ -67,10 +74,13 @@ final class FakeTransport: GaiaTransport, @unchecked Sendable {
             guard let target = payload.first.flatMap(ANCMode.init(rawValue:)) else { return }
             // No GAIA reply. The device answers late, unsolicited, or not at all.
             guard !swallowSetNotification else { return }
-            Task { [applyDelay] in
+            let previous = lock.withLock { pendingConfirmation }
+            let confirmation = Task { [applyDelay] in
                 try? await Task.sleep(for: applyDelay)
+                _ = await previous?.value
                 self.emitModeChange(target)
             }
+            lock.withLock { pendingConfirmation = confirmation }
 
         case .getMode:
             let reported = lock.withLock { reportedModeOverride ?? currentMode }

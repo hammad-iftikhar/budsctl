@@ -122,6 +122,33 @@ struct DeviceControllerTests {
         controller.stop()
     }
 
+    // Regression guard: a prior implementation silently replaced the
+    // single-slot cancel design with a serial await-chain, so each new
+    // `setMode` awaited the *entire* previous attempt — including its
+    // confirmation wait, up to `setTimeout` — before its own write even
+    // reached the transport. `setTimeout` here is made huge and the fake is
+    // told to swallow the confirmation, guaranteeing the first attempt is
+    // still waiting when the second click happens; under the serial-chain
+    // design the second write would not land until the (10 s) timeout
+    // elapsed, so a generous 500 ms budget still leaves an enormous margin
+    // against flakiness while unambiguously distinguishing the two designs.
+    @Test("a newer click's write is not held behind an older click's confirmation wait")
+    func newerClickDoesNotWaitOutOlderConfirmation() async throws {
+        let (controller, transport, _) = makeController()
+        transport.swallowSetNotification = true
+        controller.setTimeout = .seconds(10)
+
+        let start = ContinuousClock.now
+        controller.setMode(.anc)
+        controller.setMode(.passthrough)
+
+        try await until("both writes reached the transport", timeout: .milliseconds(500)) {
+            transport.recordedWrites().filter { $0.0 == .setMode }.count == 2
+        }
+        #expect(ContinuousClock.now - start < .milliseconds(500))
+        controller.stop()
+    }
+
     @Test("a mode change made on the buds or the phone updates state unprompted")
     func externalModeChange() async throws {
         let (controller, transport, bridge) = makeController(mode: .normal)
