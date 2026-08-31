@@ -60,9 +60,31 @@ public final class GaiaClient: NSObject, GaiaTransport {
     private var commandCharacteristic: CBCharacteristic?
     private var responseCharacteristic: CBCharacteristic?
 
+    /// One writer awaiting its ATT write response.
+    ///
+    /// The `id` is what makes single-resume structural: position in the FIFO is
+    /// no longer an entry's only identity, so a write that times out can remove
+    /// *itself* without desynchronising everyone behind it.
+    private struct PendingWrite {
+        let id: UInt64
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
     /// FIFO of writers awaiting their ATT write response. CoreBluetooth
-    /// delivers `didWriteValueFor` in submission order.
-    private var pendingWrites: [CheckedContinuation<Void, Error>] = []
+    /// delivers `didWriteValueFor` in submission order, so `didWriteValueFor`
+    /// resumes the oldest *remaining* entry. Every entry leaves this array in
+    /// exactly one of three ways — `didWriteValueFor`, `timeOutWrite`, or
+    /// `failPendingWrites` — and each removes before it resumes.
+    private var pendingWrites: [PendingWrite] = []
+    private var lastWriteID: UInt64 = 0
+
+    /// Bounds every write in time. CoreBluetooth is *supposed* to always call
+    /// `didWriteValueFor`, but the whole radio layer deadlocks if it ever does
+    /// not (a stale continuation would take the next write's completion), and a
+    /// `CheckedContinuation` retained in an array produces no runtime warning.
+    /// Comfortably above any real ATT round trip, including one queued behind
+    /// another write.
+    private static let writeTimeout: Duration = .seconds(5)
 
     private var discovered: [UUID: DiscoveredDevice] = [:]
 
@@ -111,11 +133,30 @@ public final class GaiaClient: NSObject, GaiaTransport {
             continuation.resume(throwing: GaiaError.notConnected)
             return
         }
-        pendingWrites.append(continuation)
+        lastWriteID += 1
+        let id = lastWriteID
+        pendingWrites.append(PendingWrite(id: id, continuation: continuation))
         // .withResponse: what the official app uses, and it gives ATT-level
         // delivery confirmation. Note this is *not* a GAIA ack — 0x0311 never
         // produces one.
         peripheral.writeValue(data, for: characteristic, type: .withResponse)
+        // Not a retry and not a poll: it only ever resumes a continuation that
+        // is still waiting, so nothing is re-sent to the device.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.writeTimeout)
+            self?.timeOutWrite(id)
+        }
+    }
+
+    /// Resumes `id` only if it is still pending. If `didWriteValueFor` or
+    /// `failPendingWrites` got there first the entry is gone and this is a
+    /// no-op, which is what makes a double resume impossible.
+    private func timeOutWrite(_ id: UInt64) {
+        guard let index = pendingWrites.firstIndex(where: { $0.id == id }) else { return }
+        let pending = pendingWrites.remove(at: index)
+        pending.continuation.resume(
+            throwing: GaiaError.writeFailed("The earbuds did not acknowledge the write.")
+        )
     }
 
     // MARK: - Connection
@@ -136,6 +177,13 @@ public final class GaiaClient: NSObject, GaiaTransport {
             report(.notConfigured)
             return
         }
+        // Selecting a different device must release the old one. Otherwise
+        // device A stays connected, subscribed and delegated to us, and its
+        // unsolicited 0x0310 frames keep overwriting state for a device the
+        // user explicitly de-selected — while its LE link never closes.
+        // `!==` so re-connecting the same peripheral does not cancel the link
+        // we are about to use.
+        if peripheral !== found { releasePeripheral() }
         peripheral = found
         found.delegate = self
         deviceName = found.name
@@ -209,33 +257,56 @@ public final class GaiaClient: NSObject, GaiaTransport {
     }
 
     public func forgetDevice() {
-        if let peripheral { central.cancelPeripheralConnection(peripheral) }
+        releasePeripheral()
+        bridge.savePeripheralIdentifier(nil)
+        report(.notConfigured)
+    }
+
+    /// Lets go of the adopted peripheral completely: closes the link, drops the
+    /// delegate so its notifications can no longer reach us, and fails anything
+    /// waiting on a write to it.
+    ///
+    /// That last part is not optional. The `didDisconnectPeripheral` that
+    /// follows `cancelPeripheralConnection` hits the `peripheral === self.peripheral`
+    /// identity guard and returns early, so it will not drain `pendingWrites`
+    /// for us — leaking a continuation here would take the *next* write's
+    /// completion and deadlock every write from then on.
+    private func releasePeripheral() {
+        guard let current = peripheral else { return }
+        current.delegate = nil
+        central.cancelPeripheralConnection(current)
         peripheral = nil
         commandCharacteristic = nil
         responseCharacteristic = nil
-        bridge.savePeripheralIdentifier(nil)
-        report(.notConfigured)
+        failPendingWrites(GaiaError.notConnected)
     }
 }
 
 extension GaiaClient: @MainActor CBCentralManagerDelegate {
 
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        switch central.state {
-        case .poweredOn:
-            attemptConnect()
-        case .poweredOff:
+        guard central.state == .poweredOn else {
+            // One call, before the per-state reporting, rather than one per
+            // case: every non-powered-on state invalidates outstanding writes,
+            // and a `.resetting` (a bluetoothd restart) or a revoked
+            // authorisation is not guaranteed to produce a
+            // `didDisconnectPeripheral` to drain them. Placed here so a state
+            // added later cannot forget it.
             failPendingWrites(GaiaError.notConnected)
-            report(.bluetoothOff)
-        case .unauthorized:
-            report(.failed("BudsCtl is not allowed to use Bluetooth. Check Privacy & Security settings."))
-        case .unsupported:
-            report(.failed("This Mac has no Bluetooth LE support."))
-        case .resetting, .unknown:
-            report(.waiting)
-        @unknown default:
-            report(.waiting)
+            switch central.state {
+            case .poweredOff:
+                report(.bluetoothOff)
+            case .unauthorized:
+                report(.failed("BudsCtl is not allowed to use Bluetooth. Check Privacy & Security settings."))
+            case .unsupported:
+                report(.failed("This Mac has no Bluetooth LE support."))
+            default:
+                // .resetting, .unknown, and anything future.
+                report(.waiting)
+            }
+            return
         }
+        attemptConnect()
     }
 
     public func centralManager(
@@ -280,10 +351,12 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
         central.connect(peripheral, options: nil)   // re-arm immediately
     }
 
+    /// Drains everything, resuming each entry exactly once. Cleared before any
+    /// resume so a re-entrant call cannot see the same entry twice.
     private func failPendingWrites(_ error: Error) {
         let waiting = pendingWrites
         pendingWrites.removeAll()
-        for continuation in waiting { continuation.resume(throwing: error) }
+        for pending in waiting { pending.continuation.resume(throwing: error) }
     }
 }
 
@@ -344,6 +417,9 @@ extension GaiaClient: @MainActor CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        // The one callback that used to lack this guard. A de-selected but
+        // still-connected peripheral must not feed the frame hub.
+        guard peripheral === self.peripheral else { return }
         guard let data = characteristic.value else { return }
         guard let frame = GaiaFrame.decode(data) else {
             // Unknown or malformed traffic is expected from a reverse
@@ -359,12 +435,15 @@ extension GaiaClient: @MainActor CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard peripheral === self.peripheral else { return }
+        // The oldest *remaining* entry: a timed-out write has already removed
+        // its own id, so removeFirst() cannot resume someone else's write.
         guard !pendingWrites.isEmpty else { return }
-        let continuation = pendingWrites.removeFirst()
+        let pending = pendingWrites.removeFirst()
         if let error {
-            continuation.resume(throwing: GaiaError.writeFailed(error.localizedDescription))
+            pending.continuation.resume(throwing: GaiaError.writeFailed(error.localizedDescription))
         } else {
-            continuation.resume()
+            pending.continuation.resume()
         }
     }
 }
