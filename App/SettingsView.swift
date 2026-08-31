@@ -1,6 +1,7 @@
 import SwiftUI
 import ServiceManagement
 import BudsKit
+import KeyboardShortcuts
 
 struct SettingsView: View {
     let model: AppModel
@@ -87,6 +88,9 @@ struct SettingsView: View {
             Text("GENERAL")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+
+            KeyboardShortcuts.Recorder("Cycle mode:", name: .cycleMode)
+                .font(.callout)
 
             Toggle("Launch at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)

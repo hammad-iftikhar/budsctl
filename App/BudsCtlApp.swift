@@ -2,6 +2,12 @@ import SwiftUI
 import Observation
 import BudsKit
 import WidgetKit
+import KeyboardShortcuts
+
+extension KeyboardShortcuts.Name {
+    // ⌥⌘N. The user can rebind it in the panel; this is only the initial value.
+    static let cycleMode = Self("cycleMode", default: .init(.n, modifiers: [.option, .command]))
+}
 
 @MainActor
 @Observable
@@ -48,6 +54,11 @@ final class AppModel {
         }
         // A request may have been posted while the agent was still launching.
         drainRequests()
+
+        // onKeyUp, not onKeyDown: a held key must not queue three mode changes.
+        KeyboardShortcuts.onKeyUp(for: .cycleMode) { [weak self] in
+            self?.controller.cycleMode()
+        }
     }
 
     func drainRequests() {
