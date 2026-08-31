@@ -64,7 +64,6 @@ public final class GaiaClient: NSObject, GaiaTransport {
     /// delivers `didWriteValueFor` in submission order.
     private var pendingWrites: [CheckedContinuation<Void, Error>] = []
 
-    private var isScanning = false
     private var discovered: [UUID: DiscoveredDevice] = [:]
 
     public var onConnectionChange: (@MainActor (ConnectionState) -> Void)?
@@ -188,12 +187,10 @@ public final class GaiaClient: NSObject, GaiaTransport {
             uniqueKeysWithValues: connectedDevices().map { ($0.id, $0) }
         )
         onDiscoveryUpdate?(discovered.values.sorted { $0.name < $1.name })
-        isScanning = true
         central.scanForPeripherals(withServices: nil, options: nil)
     }
 
     public func stopScan() {
-        isScanning = false
         central.stopScan()
     }
 
@@ -228,6 +225,7 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
         case .poweredOn:
             attemptConnect()
         case .poweredOff:
+            failPendingWrites(GaiaError.notConnected)
             report(.bluetoothOff)
         case .unauthorized:
             report(.failed("BudsCtl is not allowed to use Bluetooth. Check Privacy & Security settings."))
@@ -251,6 +249,10 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // A forgotten peripheral can still complete a connect that was in
+        // flight before `forgetDevice()` ran. Ignore it — `attemptConnect` is
+        // the only place that adopts a peripheral.
+        guard peripheral === self.peripheral else { return }
         deviceName = peripheral.name
         peripheral.discoverServices([CBUUID(string: GaiaUUIDs.service)])
     }
@@ -260,6 +262,7 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard peripheral === self.peripheral else { return }
         report(.waiting)
         central.connect(peripheral, options: nil)   // re-arm
     }
@@ -269,6 +272,7 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard peripheral === self.peripheral else { return }
         commandCharacteristic = nil
         responseCharacteristic = nil
         failPendingWrites(GaiaError.notConnected)
@@ -286,6 +290,7 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
 extension GaiaClient: @MainActor CBPeripheralDelegate {
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard peripheral === self.peripheral else { return }
         guard let service = peripheral.services?.first(where: {
             $0.uuid == CBUUID(string: GaiaUUIDs.service)
         }) else {
@@ -303,6 +308,7 @@ extension GaiaClient: @MainActor CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
+        guard peripheral === self.peripheral else { return }
         for characteristic in service.characteristics ?? [] {
             switch characteristic.uuid {
             case CBUUID(string: GaiaUUIDs.command): commandCharacteristic = characteristic
@@ -323,6 +329,7 @@ extension GaiaClient: @MainActor CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard peripheral === self.peripheral else { return }
         guard characteristic.uuid == CBUUID(string: GaiaUUIDs.response) else { return }
         if let error {
             report(.failed("Could not subscribe to the earbuds: \(error.localizedDescription)"))
