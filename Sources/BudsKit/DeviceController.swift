@@ -58,6 +58,11 @@ public final class DeviceController {
             while !Task.isCancelled {
                 guard let interval = self?.batteryInterval else { return }
                 try? await Task.sleep(for: interval)
+                // Sleep returns early when cancelled, so check before doing
+                // any work: otherwise a cancelled task still issues one last
+                // refreshBattery() — two GATT writes — before the while
+                // re-check ends the loop.
+                guard !Task.isCancelled else { return }
                 guard let self else { return }
                 guard self.state.connection.isReady else { continue }
                 await self.refreshBattery()
@@ -102,6 +107,11 @@ public final class DeviceController {
             if !firmware.contains(BudsCtl.knownGoodFirmware) {
                 state.lastError = "Untested firmware (\(firmware)). Modes may not respond."
             }
+            // Publishes like the other three cases. It used to rely on
+            // `refreshAfterConnect` publishing straight after; that tail
+            // publish is gone, so without this the firmware string and its
+            // warning would never reach the UI or the bridge.
+            publish()
 
         case .setMode:
             break   // never echoed back by this device
@@ -199,6 +209,10 @@ public final class DeviceController {
         // Reconcile and clear the optimistic state in the same turn: anything
         // that sees `isBusy` go false must already be looking at the settled mode.
         let reconciled = try? await transport.request(.getMode)
+        // Re-checked after the await, not only before it: a superseded set that
+        // resumes here must not write `state.mode` from its own read, nor flash
+        // "did not change mode" over a newer set that already succeeded.
+        guard !Task.isCancelled else { return }
         if state.pendingMode == target { state.pendingMode = nil }
         if let actual = reconciled?.mode {
             state.mode = actual
@@ -218,8 +232,13 @@ public final class DeviceController {
         _ = try? await transport.request(.getFirmware)
         _ = try? await transport.request(.getMode)
         await refreshBattery()
-        state.connection = .ready
-        publish()
+        // Nothing at the tail on purpose. `connectionChanged` already set and
+        // published `.ready` before calling this, and it is the sole writer of
+        // `state.connection`. Re-asserting `.ready` here after up to ~12 s of
+        // awaits would resurrect a connection the user has since lost: the app
+        // dispatches every connection event as its own unstructured Task, so a
+        // `connectionChanged(.waiting)` can complete correctly while this task
+        // is suspended inside a request. Each reply publishes via `apply`.
     }
 
     public func refreshBattery() async {

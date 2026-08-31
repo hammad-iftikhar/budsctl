@@ -21,6 +21,10 @@ struct DeviceControllerTests {
         return (controller, transport, bridge)
     }
 
+    /// Counts `onStateChanged` calls. MainActor-isolated, so it is Sendable
+    /// enough for the controller's `@MainActor @Sendable` callback.
+    @MainActor final class PublishCount { var count = 0 }
+
     /// Poll a condition instead of sleeping a fixed amount. Keeps the suite fast
     /// and non-flaky without pulling in an expectation framework.
     private func until(
@@ -227,6 +231,40 @@ struct DeviceControllerTests {
         await controller.refreshAfterConnect()
         try await until("firmware read") { controller.state.firmware != nil }
         #expect(controller.state.lastError == nil)
+        controller.stop()
+    }
+
+    @Test("a connect refresh cannot resurrect a connection that has since dropped")
+    func refreshDoesNotResurrectReady() async throws {
+        let (controller, _, bridge) = makeController(mode: .anc)
+        // Stands in for the real interleaving: connectionChanged(.ready) starts
+        // this refresh, the buds go back in the case, connectionChanged(.waiting)
+        // runs to completion, and only then does the refresh resume.
+        controller.state.connection = .waiting
+        await controller.refreshAfterConnect()
+        #expect(controller.state.connection == .waiting)
+        #expect(bridge.readSnapshot().connected == false)
+        controller.stop()
+    }
+
+    @Test("the firmware reply publishes, so its warning reaches the UI and the bridge")
+    func firmwarePublishes() async throws {
+        let transport = FakeTransport(mode: .anc, applyDelay: .milliseconds(30))
+        let suite = "budsctl.test.\(UUID().uuidString)"
+        let bridge = StateBridge(defaults: UserDefaults(suiteName: suite)!)
+        let published = PublishCount()
+        let controller = DeviceController(
+            transport: transport,
+            bridge: bridge,
+            onStateChanged: { published.count += 1 }
+        )
+        controller.state.connection = .ready
+        controller.start()
+        // Only the firmware getter is issued, so any publish observed here is
+        // the one the `.getFirmware` case makes.
+        try? await transport.write(.getFirmware)
+        try await until("firmware applied") { controller.state.firmware != nil }
+        #expect(published.count >= 1)
         controller.stop()
     }
 
