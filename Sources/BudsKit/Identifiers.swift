@@ -16,9 +16,6 @@ public enum BudsCtl {
 
 public enum ControlKind {
     public static let cycle = "com.hammadiftikhar.budsctl.control.cycle"
-    public static let anc = "com.hammadiftikhar.budsctl.control.anc"
-    public static let transparency = "com.hammadiftikhar.budsctl.control.transparency"
-    public static let off = "com.hammadiftikhar.budsctl.control.off"
 }
 
 public enum GaiaUUIDs {
