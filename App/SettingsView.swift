@@ -7,6 +7,13 @@ struct SettingsView: View {
     @State private var showAll = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var registrationError: String?
+    // Guards a programmatic assignment to `launchAtLogin` (resyncing from
+    // SMAppService, or correcting after a failed register/unregister) so it
+    // does not re-trigger `onChange` and fire a second, unrequested
+    // register()/unregister() call. Set immediately before every such
+    // assignment; cleared by the observer itself, since onChange runs on the
+    // next view update, not synchronously after the write.
+    @State private var isSyncingToggle = false
 
     private var selected: UUID? { model.bridge.peripheralIdentifier }
 
@@ -85,6 +92,8 @@ struct SettingsView: View {
                 .toggleStyle(.checkbox)
                 .font(.callout)
                 .onChange(of: launchAtLogin) { _, wanted in
+                    // A programmatic correction, not a user action: swallow it.
+                    if isSyncingToggle { isSyncingToggle = false; return }
                     apply(wanted)
                 }
 
@@ -97,6 +106,7 @@ struct SettingsView: View {
         }
         .task(id: model.controller.state.connection) {
             model.refreshDevices()
+            isSyncingToggle = true
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
     }
@@ -111,6 +121,7 @@ struct SettingsView: View {
             registrationError = nil
         } catch {
             registrationError = error.localizedDescription
+            isSyncingToggle = true
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
         // `requiresApproval` means macOS is waiting on the user in

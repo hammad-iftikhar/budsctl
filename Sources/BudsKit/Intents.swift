@@ -42,10 +42,21 @@ public enum ANCModeAppEnum: String, AppEnum {
 /// is available on every `AppIntent` with no protocol conformance needed. Using the
 /// deprecated pair here would build clean today but leave a warning-free build
 /// commitment resting on soon-to-be-removed API for no behavioral difference.
+///
+/// `continueInForeground()` is gated on `supportedModes` declaring
+/// `.foreground(.dynamic)` — the deprecation message on `ForegroundContinuableIntent`
+/// names this as the replacement mechanism, and `IntentModes.Current.canContinueInForeground`
+/// strongly implies the runtime checks it. Declared below on both intents; not
+/// verified at runtime (needs a GUI session — see the task report).
 public struct SetModeIntent: AppIntent {
     public static let title: LocalizedStringResource = "Set Noise Mode"
     public static let description = IntentDescription("Set the earbuds' noise mode.")
     public static var openAppWhenRun: Bool { false }
+    // The SDK's replacement for ForegroundContinuableIntent: continueInForeground()
+    // is gated on the intent declaring that it may run in the foreground.
+    // .background is what we normally want (post to the running agent and return);
+    // .foreground(.dynamic) is what permits the cold-start launch.
+    public static var supportedModes: IntentModes { [.background, .foreground(.dynamic)] }
 
     @Parameter(title: "Mode")
     public var mode: ANCModeAppEnum
@@ -76,6 +87,8 @@ public struct CycleModeIntent: AppIntent {
         "Move to the next noise mode: off, then noise cancellation, then transparency."
     )
     public static var openAppWhenRun: Bool { false }
+    // See SetModeIntent's supportedModes comment.
+    public static var supportedModes: IntentModes { [.background, .foreground(.dynamic)] }
 
     public var injectedBridge: StateBridge?
     private var bridge: StateBridge { injectedBridge ?? .shared }

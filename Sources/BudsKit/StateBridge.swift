@@ -64,7 +64,11 @@ public final class StateBridge: @unchecked Sendable {
     @discardableResult
     public func postRequest(_ request: BridgeRequest) -> Int {
         let seq = defaults.integer(forKey: Key.requestSeq) + 1
-        guard let data = try? JSONEncoder().encode(request) else { return seq - 1 }
+        // On encode failure, nothing is persisted, so `seq` is never reachable
+        // by `handledSeq`. Returning it (not `seq - 1`, which is the already-
+        // persisted value) makes `waitForHandling` report false — failing
+        // safe — instead of an intent falsely claiming the request succeeded.
+        guard let data = try? JSONEncoder().encode(request) else { return seq }
         defaults.set(data, forKey: Key.request)
         defaults.set(seq, forKey: Key.requestSeq)
         // ponytail: no synchronize() call. Darwin delivery is slower than the
