@@ -56,6 +56,46 @@ struct StateBridgeTests {
         #expect(bridge.takeRequest() == nil)
     }
 
+    @Test("a request this build cannot decode is left unhandled, not silently eaten")
+    func undecodableRequest() {
+        let defaults = scratchDefaults()
+        let bridge = StateBridge(defaults: defaults)
+        // What version skew looks like: an agent older than the extension,
+        // after a BridgeRequest case it does not know about was added.
+        defaults.set(Data("{\"seq\":7,\"request\":{\"quantumMode\":{}}}".utf8), forKey: "request")
+        #expect(bridge.takeRequest() == nil)
+        // The important half. If handledSeq advanced here, waitForHandling
+        // would report true and the intent would claim success for a request
+        // nobody applied; leaving it alone makes the intent launch the agent.
+        #expect(bridge.handledSeq == 0)
+    }
+
+    @Test("the seq travels inside the request blob, so one read sees both or neither")
+    func requestAndSeqAreOneValue() {
+        let defaults = scratchDefaults()
+        let bridge = StateBridge(defaults: defaults)
+        let seq = bridge.postRequest(.setMode(.anc))
+        // A single key holds the payload; there is no separate seq key that
+        // could be read stale beside a fresh payload.
+        #expect(defaults.data(forKey: "request") != nil)
+        #expect(defaults.object(forKey: "requestSeq") == nil)
+        #expect(bridge.takeRequest() == .setMode(.anc))
+        #expect(bridge.handledSeq == seq)
+    }
+
+    @Test("a request whose blob is lost still gets a seq the agent has not passed")
+    func seqSurvivesALostPayload() {
+        let defaults = scratchDefaults()
+        let bridge = StateBridge(defaults: defaults)
+        let first = bridge.postRequest(.cycleMode)
+        #expect(bridge.takeRequest() == .cycleMode)
+        // The seq no longer has its own key, so it lives or dies with the blob.
+        defaults.removeObject(forKey: "request")
+        let second = bridge.postRequest(.setMode(.anc))
+        #expect(second > first)
+        #expect(bridge.takeRequest() == .setMode(.anc))
+    }
+
     @Test("the peripheral identifier persists and can be cleared")
     func peripheralIdentifier() {
         let bridge = StateBridge(defaults: scratchDefaults())

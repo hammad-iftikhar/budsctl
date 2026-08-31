@@ -18,10 +18,24 @@ public final class StateBridge: @unchecked Sendable {
 
     private enum Key {
         static let snapshot = "snapshot"
+        /// Payload *and* seq together — see `StoredRequest`.
         static let request = "request"
-        static let requestSeq = "requestSeq"
         static let handledSeq = "handledSeq"
         static let peripheralIdentifier = "peripheralIdentifier"
+    }
+
+    /// The request and its seq in one value under one key.
+    ///
+    /// They used to be two keys. The writer ordered them safely (payload, then
+    /// seq), but the reader is a *different process* doing two independent
+    /// CFPreferences lookups, with no guarantee both caches were invalidated
+    /// together. Seeing a stale seq beside a fresh payload applied the new
+    /// request while recording the old seq — and the next `drainRequests()`
+    /// (one Darwin burst usually delivers more than one) applied it again. One
+    /// Control Center tap, two cycle advances.
+    private struct StoredRequest: Codable {
+        let seq: Int
+        let request: BridgeRequest
     }
 
     private let defaults: UserDefaults
@@ -63,14 +77,18 @@ public final class StateBridge: @unchecked Sendable {
 
     @discardableResult
     public func postRequest(_ request: BridgeRequest) -> Int {
-        let seq = defaults.integer(forKey: Key.requestSeq) + 1
+        // Also floored at handledSeq, so a lost or undecodable stored request
+        // cannot hand out a seq the agent has already passed — which would be
+        // taken for "already handled" and dropped.
+        let seq = max(storedRequest()?.seq ?? 0, handledSeq) + 1
         // On encode failure, nothing is persisted, so `seq` is never reachable
         // by `handledSeq`. Returning it (not `seq - 1`, which is the already-
         // persisted value) makes `waitForHandling` report false — failing
         // safe — instead of an intent falsely claiming the request succeeded.
-        guard let data = try? JSONEncoder().encode(request) else { return seq }
+        guard let data = try? JSONEncoder().encode(
+            StoredRequest(seq: seq, request: request)
+        ) else { return seq }
         defaults.set(data, forKey: Key.request)
-        defaults.set(seq, forKey: Key.requestSeq)
         // ponytail: no synchronize() call. Darwin delivery is slower than the
         // CFPreferences write path in practice; if a request is ever seen stale,
         // add defaults.synchronize() here before reaching for anything larger.
@@ -107,13 +125,26 @@ public final class StateBridge: @unchecked Sendable {
     /// Returns the pending request, or nil if there is none or it was already
     /// handled. Only the agent calls this.
     public func takeRequest() -> BridgeRequest? {
-        let seq = defaults.integer(forKey: Key.requestSeq)
-        guard seq > defaults.integer(forKey: Key.handledSeq) else { return nil }
-        defaults.set(seq, forKey: Key.handledSeq)
-        guard let data = defaults.data(forKey: Key.request),
-              let request = try? JSONDecoder().decode(BridgeRequest.self, from: data)
-        else { return nil }
-        return request
+        // One lookup, so the seq and the payload cannot be observed out of
+        // sync across the process boundary.
+        guard let stored = storedRequest() else { return nil }
+        guard stored.seq > handledSeq else { return nil }
+        // Advanced only now, after a successful decode. Advancing first threw
+        // an undecodable request away while `waitForHandling` still reported
+        // true, so an intent said "Set to …" for a request nobody applied —
+        // reachable through version skew, e.g. an installed agent older than
+        // the extension after a `BridgeRequest` case is added. Leaving
+        // `handledSeq` alone instead makes such a request read as unhandled,
+        // so the intent takes the launch path.
+        defaults.set(stored.seq, forKey: Key.handledSeq)
+        return stored.request
+    }
+
+    /// nil when there is nothing stored, or when what is stored cannot be
+    /// decoded by this build.
+    private func storedRequest() -> StoredRequest? {
+        guard let data = defaults.data(forKey: Key.request) else { return nil }
+        return try? JSONDecoder().decode(StoredRequest.self, from: data)
     }
 
     public func observeRequests(_ handler: @escaping @Sendable () -> Void) {
