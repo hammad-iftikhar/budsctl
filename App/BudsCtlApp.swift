@@ -39,6 +39,21 @@ final class AppModel {
 
         controller.start()
         client.start()
+
+        // Control Center and Shortcuts post requests here. Darwin
+        // notifications coalesce, so always drain rather than assuming one
+        // notification means one request.
+        bridge.observeRequests { [weak self] in
+            Task { @MainActor in self?.drainRequests() }
+        }
+        // A request may have been posted while the agent was still launching.
+        drainRequests()
+    }
+
+    func drainRequests() {
+        while let request = bridge.takeRequest() {
+            controller.handle(request)
+        }
     }
 
     /// Cheap: a retrieve, not a scan. Safe to call every time settings opens.
