@@ -1,5 +1,7 @@
 # BudsCtl
 
+![BudsCtl menu bar panel](docs/screenshots/panel.png)
+
 macOS menu bar control for SoundPEATS Air4 Pro noise modes — normal, ANC, and
 transparency — from the menu bar, Control Center, Shortcuts, and a global
 hotkey (⌥⌘N).
