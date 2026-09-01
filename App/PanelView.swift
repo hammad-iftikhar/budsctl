@@ -74,14 +74,22 @@ struct PanelView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            // Stays enabled while busy on purpose: a user changing their mind
-            // mid-flight should win. Disabled only when there is no link.
-            .disabled(!state.connection.isReady)
+            // Stays enabled while *busy* on purpose: a user changing their
+            // mind mid-flight should win. Disabled when there is no link, and
+            // while the mode is still being read — until that first read lands
+            // the segment showing as selected is a guess, so letting it be
+            // clicked would invite setting the mode you are already in.
+            .disabled(!state.connection.isReady || state.isResolvingMode)
 
             if state.isBusy {
                 HStack(spacing: 5) {
                     ProgressView().controlSize(.small)
                     Text("Applying…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if state.isResolvingMode {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading mode…").font(.caption).foregroundStyle(.secondary)
                 }
             }
         }

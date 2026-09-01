@@ -320,4 +320,94 @@ struct DeviceControllerTests {
         #expect(idleTransport.recordedWrites().isEmpty)
         controller.stop(); idle.stop()
     }
+    // MARK: - The post-connect settle re-read
+
+    @Test("a stale mode read at connect is corrected by the settle re-read")
+    func settleCorrectsStaleModeRead() async throws {
+        // The device answers Off while it is still waking, then tells the
+        // truth. It never notifies — exactly what the hardware was measured
+        // doing, and the reason one read on connect is not enough.
+        let (controller, transport, _) = makeController(mode: .normal)
+        controller.settleReads = [.milliseconds(20)]
+        controller.state.mode = nil
+
+        await controller.connectionChanged(.ready)
+        try await until("the bad first read landed") { controller.state.mode == .normal }
+
+        transport.reportedModeOverride = .anc
+        try await until("settle corrected it") { controller.state.mode == .anc }
+        controller.stop()
+    }
+
+    @Test("a set outranks the settle re-read, so a stale read cannot overwrite it")
+    func settleDoesNotClobberAUserSet() async throws {
+        let (controller, transport, _) = makeController(mode: .normal)
+        // Long enough that the re-read would land well after the set if it
+        // were still armed.
+        controller.settleReads = [.milliseconds(50)]
+        await controller.connectionChanged(.ready)
+
+        // The device is still stale and would report Off if asked again.
+        transport.reportedModeOverride = .normal
+        controller.setMode(.passthrough)
+        try await until("the set was confirmed") { controller.state.mode == .passthrough }
+
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(controller.state.mode == .passthrough)
+        controller.stop()
+    }
+
+    @Test("the settle re-read stops when the earbuds go away")
+    func settleStopsOnDisconnect() async throws {
+        let (controller, transport, _) = makeController(mode: .normal)
+        controller.settleReads = [.milliseconds(50)]
+        await controller.connectionChanged(.ready)
+        let afterConnect = transport.recordedWrites().filter { $0.0 == .getMode }.count
+
+        await controller.connectionChanged(.waiting)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(transport.recordedWrites().filter { $0.0 == .getMode }.count == afterConnect)
+        controller.stop()
+    }
+
+    @Test("the mode reads as unresolved until the first settle read lands")
+    func resolvingClearsOnFirstSettleRead() async throws {
+        let (controller, _, _) = makeController(mode: .normal)
+        controller.settleReads = [.milliseconds(30), .seconds(45)]
+        controller.state.mode = nil
+
+        await controller.connectionChanged(.ready)
+        // The connect read has landed, but it is the untrustworthy one.
+        #expect(controller.state.isResolvingMode)
+
+        try await until("first settle read landed") { !controller.state.isResolvingMode }
+        // Cleared by the first read, not by the whole 45 s schedule finishing.
+        #expect(controller.state.mode == .normal)
+        controller.stop()
+    }
+
+    @Test("a set clears the loader rather than making the user wait it out")
+    func settingAModeClearsResolving() async throws {
+        let (controller, _, _) = makeController(mode: .normal)
+        controller.settleReads = [.seconds(45)]
+        await controller.connectionChanged(.ready)
+        #expect(controller.state.isResolvingMode)
+
+        controller.setMode(.anc)
+        #expect(controller.state.isResolvingMode == false)
+        controller.stop()
+    }
+
+    @Test("losing the earbuds clears the loader")
+    func disconnectClearsResolving() async throws {
+        let (controller, _, _) = makeController(mode: .normal)
+        controller.settleReads = [.seconds(45)]
+        await controller.connectionChanged(.ready)
+        #expect(controller.state.isResolvingMode)
+
+        await controller.connectionChanged(.waiting)
+        #expect(controller.state.isResolvingMode == false)
+        controller.stop()
+    }
+
 }

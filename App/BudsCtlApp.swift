@@ -146,7 +146,11 @@ struct BudsCtlApp: App {
             // Template rendering, so it adapts to light, dark and tinted bars.
             Image(systemName: model.controller.state.menuBarSymbol)
                 .foregroundStyle(model.controller.state.connection.isReady ? .primary : .tertiary)
-                .symbolEffect(.pulse, isActive: model.controller.state.isBusy)
+                .symbolEffect(
+                    .pulse,
+                    isActive: model.controller.state.isBusy
+                        || model.controller.state.isResolvingMode
+                )
         }
         .menuBarExtraStyle(.window)
     }
