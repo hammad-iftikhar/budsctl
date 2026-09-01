@@ -90,6 +90,13 @@ public final class GaiaClient: NSObject, GaiaTransport {
     /// An explicit scan request that arrived before the radio was ready.
     private var wantsScan = false
 
+    /// Demotes a stalled `.connecting` to `.waiting`. See `attemptConnect`.
+    private var connectWatchdog: Task<Void, Never>?
+    /// How long a connect may sit pending before we stop calling it
+    /// "Connecting…". Comfortably longer than a real LE connect, which is
+    /// 1-3 s once the peripheral is actually reachable.
+    private static let connectGrace: Duration = .seconds(5)
+
     public var onConnectionChange: (@MainActor (ConnectionState) -> Void)?
     public var onDiscoveryUpdate: (@MainActor ([DiscoveredDevice]) -> Void)?
     public private(set) var deviceName: String?
@@ -193,6 +200,21 @@ public final class GaiaClient: NSObject, GaiaTransport {
         // Stays pending indefinitely if the buds are in the case. This is the
         // auto-reconnect mechanism, not a failure.
         central.connect(found, options: nil)
+
+        // But an unbounded pending connect must not read as "Connecting…"
+        // forever. The buds do not always accept an LE connection while they
+        // are busy carrying audio, and a spinner that never resolves looks
+        // like the app has hung rather than like it is waiting. `.waiting` is
+        // the state the design already has for "armed, buds unavailable", and
+        // it is the honest label. The connect stays armed either way -- only
+        // what we tell the user changes.
+        connectWatchdog?.cancel()
+        connectWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: Self.connectGrace)
+            guard !Task.isCancelled, let self else { return }
+            guard self.peripheral?.state != .connected else { return }
+            self.report(.waiting)
+        }
     }
 
     // MARK: - Discovery
@@ -289,6 +311,8 @@ public final class GaiaClient: NSObject, GaiaTransport {
     /// for us — leaking a continuation here would take the *next* write's
     /// completion and deadlock every write from then on.
     private func releasePeripheral() {
+        connectWatchdog?.cancel()
+        connectWatchdog = nil
         guard let current = peripheral else { return }
         current.delegate = nil
         central.cancelPeripheralConnection(current)
@@ -428,6 +452,9 @@ extension GaiaClient: @MainActor CBPeripheralDelegate {
             return
         }
         // Ready is gated on the subscription, never on didConnect.
+        // Connected and subscribed: the watchdog has nothing left to demote.
+        connectWatchdog?.cancel()
+        connectWatchdog = nil
         report(.ready)
     }
 
