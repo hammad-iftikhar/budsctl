@@ -6,3 +6,6 @@ xcuserdata/
 DerivedData/
 App/Info.plist
 Controls/Info.plist
+
+# Release artifacts
+*.dmg
