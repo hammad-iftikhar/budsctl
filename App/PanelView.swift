@@ -20,6 +20,18 @@ struct PanelView: View {
                 batteryRow
             }
 
+            // The buds stop advertising their LE service after a while, even
+            // while they are happily playing audio over the classic link. A
+            // pending connect then waits forever for an advertisement that
+            // never comes, and a scan cannot help — there is nothing to find.
+            // Only the earbuds can fix it, so say how.
+            if state.connection == .waiting {
+                Text("Put the earbuds in the case and take them out again to reconnect.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if state.connection == .bluetoothOff {
                 Button("Open Bluetooth Settings") {
                     if let url = URL(string: "x-apple.systempreferences:com.apple.Bluetooth") {
