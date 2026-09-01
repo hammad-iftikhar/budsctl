@@ -69,6 +69,24 @@ final class AppModel {
         ) { [weak self] _ in
             Task { @MainActor in await self?.controller.refreshOnWake() }
         }
+
+        // Nothing else tells Shortcuts or Control Center that the agent is
+        // gone. Without this, they keep reporting a live mode and a stale
+        // battery for a process that no longer exists. Posted locally by our
+        // own NSApplication, so it fires for an LSUIElement agent exactly as
+        // it would for a regular app — unlike NSWorkspace's termination
+        // notifications, which only observe *other* processes.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            // Mode is kept — it is still the last thing the device reported.
+            // Battery is dropped, matching what `connectionChanged` already
+            // does for a live disconnect.
+            self.bridge.publish(ModeSnapshot(mode: self.controller.state.mode, connected: false))
+        }
     }
 
     func drainRequests() {
