@@ -73,6 +73,28 @@ public final class StateBridge: @unchecked Sendable {
         return snapshot
     }
 
+    /// Poll until a published snapshot satisfies `predicate`, or give up and
+    /// return whatever the last read was.
+    ///
+    /// Same shape as `waitForHandling`, and for the same reason: this runs
+    /// inside a control extension or an intent with a short execution
+    /// budget, so a cheap poll beats standing up an observer for one shot.
+    /// `waitForHandling` only tells a caller the agent *took* a request —
+    /// not that it applied it — so `SetModeIntent` uses this afterward to
+    /// confirm the device actually got there before reporting success.
+    public func waitForSnapshot(
+        timeout: Duration,
+        matching predicate: @Sendable (ModeSnapshot) -> Bool
+    ) async -> ModeSnapshot {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            let snapshot = readSnapshot()
+            if predicate(snapshot) { return snapshot }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return readSnapshot()
+    }
+
     // MARK: - Requests, extension to agent
 
     @discardableResult

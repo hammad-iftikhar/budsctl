@@ -45,10 +45,94 @@ struct IntentsTests {
         Task {
             try? await Task.sleep(for: .milliseconds(50))
             taken.value = bridge.takeRequest()
+            // Simulate the agent actually applying the change, so perform()'s
+            // post-handling snapshot wait resolves quickly instead of running
+            // out its full timeout — this test is about the request, not the
+            // honest-reporting wait, which has its own tests below.
+            bridge.publish(ModeSnapshot(mode: .passthrough, connected: true))
         }
         _ = try await intent.perform()
         #expect(taken.value == .setMode(.passthrough))
         #expect(bridge.takeRequest() == nil)
+    }
+
+    /// `perform()`'s declared return type is `some IntentResult &
+    /// ProvidesDialog`, but `IntentResult` itself declares no `dialog`
+    /// requirement — only the concrete (framework-private)
+    /// `IntentResultContainer` actually stores one. There is no supported API
+    /// to read it back through the opaque return type, so this reaches past
+    /// it with `String(describing:)`, which walks the concrete struct's
+    /// fields via reflection regardless of what the static type exposes.
+    /// `IntentDialog(_:)` stores its argument as a `LocalizedStringResource`
+    /// whose `key` is that exact string, and `key: "..."` shows up verbatim
+    /// in the description — fragile in the sense that it leans on that
+    /// implementation detail, but it is the only way to assert dialog text
+    /// from a unit test at all.
+    private func dialogText(_ result: some Any) -> String {
+        String(describing: result)
+    }
+
+    @Test("a set intent reports success only once the snapshot confirms the change")
+    func setIntentReportsSuccessAfterConfirmation() async throws {
+        let bridge = scratchBridge()
+        var intent = SetModeIntent()
+        intent.mode = .noiseCancellation
+        intent.injectedBridge = bridge
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            _ = bridge.takeRequest()
+            // The device takes ~1.4 s in real life; a short delay here is
+            // enough to prove the intent actually polls rather than checking
+            // only once.
+            try? await Task.sleep(for: .milliseconds(100))
+            bridge.publish(ModeSnapshot(mode: .anc, connected: true))
+        }
+        let start = ContinuousClock.now
+        let result = try await intent.perform()
+        // String interpolation inside `IntentDialog(_:)` becomes a format
+        // string plus a separate argument, not one flat literal — so this
+        // checks for the template and the interpolated mode name separately.
+        let text = dialogText(result)
+        #expect(text.contains(#"key: "Set to %@""#))
+        #expect(text.contains(#"value("Noise Cancellation")"#))
+        // Resolved once confirmed, not after riding out the full budget.
+        #expect(start.duration(to: .now) < .seconds(2))
+    }
+
+    @Test("a set intent reports failure honestly when the buds never confirm")
+    func setIntentReportsFailureWhenUnconfirmed() async throws {
+        let bridge = scratchBridge()
+        var intent = SetModeIntent()
+        intent.mode = .transparency
+        intent.injectedBridge = bridge
+        intent.confirmationTimeout = .milliseconds(300)
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            _ = bridge.takeRequest()
+            // Taken, but never applied — e.g. the buds are in the case. No
+            // matching snapshot is ever published.
+        }
+        let result = try await intent.perform()
+        #expect(dialogText(result).contains(#"key: "BudsCtl could not reach the earbuds.""#))
+        #expect(!dialogText(result).contains("Set to"))
+    }
+
+    @Test("a set intent reports failure honestly when the buds land on a different mode")
+    func setIntentReportsFailureOnWrongMode() async throws {
+        let bridge = scratchBridge()
+        var intent = SetModeIntent()
+        intent.mode = .noiseCancellation
+        intent.injectedBridge = bridge
+        intent.confirmationTimeout = .milliseconds(300)
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            _ = bridge.takeRequest()
+            // Connected, but settled on a mode other than the one requested —
+            // e.g. a competing request from the phone won the race.
+            bridge.publish(ModeSnapshot(mode: .passthrough, connected: true))
+        }
+        let result = try await intent.perform()
+        #expect(dialogText(result).contains(#"key: "BudsCtl could not reach the earbuds.""#))
     }
 
     @Test("a cycle intent leaves a cycle request")

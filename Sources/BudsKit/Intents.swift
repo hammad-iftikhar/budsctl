@@ -66,12 +66,29 @@ public struct SetModeIntent: AppIntent {
     public var injectedBridge: StateBridge?
     private var bridge: StateBridge { injectedBridge ?? .shared }
 
+    /// Set by tests only, for the same reason as `injectedBridge`: the real
+    /// value gives the device's ~1.4 s apply window realistic headroom, but
+    /// that makes the honest-failure path slow to exercise in a unit test.
+    public var confirmationTimeout: Duration = .seconds(3)
+
     public init() {}
 
     public func perform() async throws -> some IntentResult & ProvidesDialog {
-        let seq = bridge.postRequest(.setMode(mode.asANCMode))
+        let target = mode.asANCMode
+        let seq = bridge.postRequest(.setMode(target))
         if await bridge.waitForHandling(of: seq, timeout: .seconds(2)) {
-            return .result(dialog: IntentDialog("Set to \(mode.asANCMode.label)"))
+            // The agent only *took* the request here — with the buds in the
+            // case that's as far as it gets. The device takes ~1.4 s to
+            // apply and confirm a mode change, so wait for a published
+            // snapshot to actually reflect it before telling Shortcuts this
+            // worked; 3 s gives that real-world timing headroom.
+            let snapshot = await bridge.waitForSnapshot(timeout: confirmationTimeout) {
+                $0.connected && $0.mode == target
+            }
+            guard snapshot.connected, snapshot.mode == target else {
+                return .result(dialog: IntentDialog("BudsCtl could not reach the earbuds."))
+            }
+            return .result(dialog: IntentDialog("Set to \(target.label)"))
         }
         // Nothing picked the request up, so the agent is not running. Launch
         // it — it drains pending requests on start, so the original request

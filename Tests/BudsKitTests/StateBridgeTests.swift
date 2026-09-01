@@ -159,4 +159,44 @@ struct StateBridgeTests {
         }
         #expect(await bridge.waitForHandling(of: seq, timeout: .seconds(2)) == true)
     }
+
+    @Test("waitForSnapshot returns immediately when the current snapshot already matches")
+    func waitForSnapshotAlreadyMatches() async {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        bridge.publish(ModeSnapshot(mode: .anc, connected: true))
+        let start = ContinuousClock.now
+        let snapshot = await bridge.waitForSnapshot(timeout: .seconds(2)) {
+            $0.connected && $0.mode == .anc
+        }
+        #expect(snapshot.mode == .anc)
+        #expect(start.duration(to: .now) < .milliseconds(500))
+    }
+
+    @Test("waitForSnapshot catches a match published while it is polling")
+    func waitForSnapshotCatchesLateMatch() async {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            bridge.publish(ModeSnapshot(mode: .passthrough, connected: true))
+        }
+        let start = ContinuousClock.now
+        let snapshot = await bridge.waitForSnapshot(timeout: .seconds(2)) {
+            $0.connected && $0.mode == .passthrough
+        }
+        #expect(snapshot.mode == .passthrough)
+        // Caught well before the 2 s timeout, proving the loop polls rather
+        // than only checking once at the deadline.
+        #expect(start.duration(to: .now) < .seconds(1))
+    }
+
+    @Test("waitForSnapshot gives up and returns the last snapshot when nothing ever matches")
+    func waitForSnapshotTimesOut() async {
+        let bridge = StateBridge(defaults: scratchDefaults())
+        bridge.publish(ModeSnapshot(mode: .normal, connected: true))
+        let snapshot = await bridge.waitForSnapshot(timeout: .milliseconds(300)) {
+            $0.mode == .anc
+        }
+        // The mismatching snapshot is still returned honestly, not nil'd out.
+        #expect(snapshot.mode == .normal)
+    }
 }
