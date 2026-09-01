@@ -42,5 +42,5 @@ swift run budsctl-cli status     # against real hardware
 ## Protocol
 
 GAIA V2 over BLE, reverse engineered for interoperability from traffic to a
-device the author owns. See `docs/superpowers/specs/main.md` §1. Verified
+device the author owns. See `docs/superpowers/specs/2026-08-31-budsctl.md` §1. Verified
 against firmware `AIR4PRO-BS588R2E_20241112_v0.2.1`.
