@@ -129,12 +129,6 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let firmware = state.firmware {
-                Text(firmware)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
-            }
             DisclosureGroup("Settings", isExpanded: $showSettings) {
                 SettingsView(model: model)
                     .padding(.top, 6)
