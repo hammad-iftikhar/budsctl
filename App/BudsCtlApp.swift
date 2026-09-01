@@ -81,11 +81,21 @@ final class AppModel {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            // Mode is kept — it is still the last thing the device reported.
-            // Battery is dropped, matching what `connectionChanged` already
-            // does for a live disconnect.
-            self.bridge.publish(ModeSnapshot(mode: self.controller.state.mode, connected: false))
+            // Deliberately synchronous, not `Task { @MainActor in ... }` like
+            // the wake observer above: the process can exit immediately after
+            // every `willTerminateNotification` observer returns, so this
+            // publish must happen before this closure returns, not on some
+            // later run-loop turn that may never come. `queue: .main` already
+            // guarantees this runs on the main thread; `assumeIsolated` tells
+            // the compiler what is already true at runtime instead of hopping
+            // through an async Task that could get skipped entirely.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Mode is kept — it is still the last thing the device
+                // reported. Battery is dropped, matching what
+                // `connectionChanged` already does for a live disconnect.
+                self.bridge.publish(ModeSnapshot(mode: self.controller.state.mode, connected: false))
+            }
         }
     }
 
