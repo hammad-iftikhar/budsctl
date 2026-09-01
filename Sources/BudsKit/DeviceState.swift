@@ -32,6 +32,15 @@ public final class DeviceState {
     public var mode: ANCMode?
     /// Optimistic target during the device's ~1.4 s apply window.
     public var pendingMode: ANCMode?
+    /// True from the moment a connection lands until the first re-read of the
+    /// mode comes back.
+    ///
+    /// Separate from `isBusy`, which means a set of *ours* is in flight. This
+    /// one means we do not yet know what the device is doing. The read taken as
+    /// the link comes up is the least trustworthy one we ever take — see
+    /// `DeviceController.settleMode` — so the UI says it is still reading
+    /// rather than presenting that read as a confident selection.
+    public var isResolvingMode = false
     public var batteryLeft: Int?
     public var batteryRight: Int?
     public var firmware: String?

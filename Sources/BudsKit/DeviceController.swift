@@ -19,6 +19,9 @@ public final class DeviceController {
     private var frameTask: Task<Void, Never>?
     private var batteryTask: Task<Void, Never>?
     private var inFlight: Task<Void, Never>?
+    /// Bounded re-read of the mode over the first minute of a connection.
+    /// See `settleMode` for why one read on connect is not enough.
+    private var settleTask: Task<Void, Never>?
     /// Serializes only the write step of successive `setMode` calls, so a
     /// superseded click's write cannot land after a newer one's. See
     /// `performSet` for why this is not the same thing as the queue that was
@@ -29,6 +32,11 @@ public final class DeviceController {
     public var setTimeout: Duration = .seconds(3)
     /// Battery refresh interval while connected.
     public var batteryInterval: Duration = .seconds(300)
+    /// When to re-read the mode, as offsets from the moment the connection
+    /// landed — not gaps between reads. See `settleMode`.
+    public var settleReads: [Duration] = [
+        .seconds(2), .seconds(5), .seconds(10), .seconds(20), .seconds(45),
+    ]
 
     public init(
         transport: GaiaTransport,
@@ -74,6 +82,8 @@ public final class DeviceController {
         frameTask?.cancel(); frameTask = nil
         batteryTask?.cancel(); batteryTask = nil
         inFlight?.cancel(); inFlight = nil
+        settleTask?.cancel(); settleTask = nil
+        state.isResolvingMode = false
         // Dropping the reference only. Neither GaiaClient.write nor
         // FakeTransport.write checks Task.isCancelled, so cancelling the write
         // chain cannot abort a GATT write already queued behind an earlier one.
@@ -128,6 +138,12 @@ public final class DeviceController {
     /// Fire and forget. Returns immediately with the UI already showing the
     /// target, and coalesces: a newer target cancels the older wait.
     public func setMode(_ target: ANCMode) {
+        // The user has told us what the mode is. Nothing the settle sequence
+        // could read afterwards is worth more than that, and a re-read that
+        // resolved while the device was still stale would overwrite it.
+        settleTask?.cancel(); settleTask = nil
+        // A mode the user picked is not something to show a loader over.
+        state.isResolvingMode = false
         inFlight?.cancel()
         state.pendingMode = target
         inFlight = Task { [weak self] in await self?.performSet(target) }
@@ -241,6 +257,71 @@ public final class DeviceController {
         // is suspended inside a request. Each reply publishes via `apply`.
     }
 
+    /// Re-read the mode a few times over the first minute of a connection.
+    ///
+    /// Measured on an Air4 Pro (firmware `..._v0.2.1`): the earbuds do not
+    /// reliably serve GAIA reads in the window right after the link comes up.
+    /// A read taken there either times out outright or answers `0x00` (Off)
+    /// while the buds are actually in ANC — and the device sends *nothing*
+    /// when it later adopts its saved mode. Thirty-three seconds of complete
+    /// notification silence were recorded after a case-exit connect, while a
+    /// read taken afterwards reported ANC correctly.
+    ///
+    /// So the single read in `refreshAfterConnect` is not enough on its own,
+    /// and there is no notification that would ever correct it. That is the
+    /// whole bug: the app showed "Off" for the rest of the connection.
+    ///
+    /// This is not the plan's "never poll the mode" rule being broken. It is
+    /// bounded, runs at most once per connection, stops the moment the user
+    /// sets a mode, and issues five reads rather than a steady stream.
+    ///
+    /// The offsets are measured from the connection, not chained end to end.
+    /// Chaining them let one timed-out read — and an unsettled device times
+    /// reads out, which is the whole problem here — push every later read out
+    /// by the 3 s timeout, so a nominal 5/20/60 s schedule really fired at
+    /// 5/25/85 s. Anchoring to a start instant keeps the last read where it
+    /// says it is however many earlier ones failed.
+    ///
+    /// ponytail: fixed offsets, not a characterised settle window — the window
+    /// was only ever bracketed as "wrong at connect, right within 44 s", so
+    /// the early reads are cheap guesses at the near edge and the 45 s one is
+    /// the backstop. Re-reads are safe to pile on because the device settles
+    /// one way: once it answers with the real mode it does not go back to
+    /// `0x00`. If buds turn up that settle later, extend the list rather than
+    /// making it continuous.
+    private func settleMode() async {
+        // No `defer` clearing the flag on the way out. Every exit from this
+        // loop is a cancellation, and all three cancellers — connectionChanged,
+        // setMode, stop — clear it themselves, synchronously. A defer here
+        // would run whenever this task next got scheduled, which can be after
+        // a *later* connection has raised the flag again, and would then clear
+        // that connection's loader instead of this one's.
+        let start = ContinuousClock.now
+        for offset in settleReads {
+            let remaining = start + offset - ContinuousClock.now
+            if remaining > .zero { try? await Task.sleep(for: remaining) }
+            // Re-checked after every sleep: the buds can go back in the case,
+            // and a set in flight is a better source of truth than a re-read.
+            guard !Task.isCancelled,
+                  state.connection.isReady,
+                  state.pendingMode == nil
+            else { return }
+            // The reply reaches `state` through `apply`, like every other read.
+            _ = try? await transport.request(.getMode)
+            // The UI stops waiting after the *first* of these lands, not after
+            // all of them. The later reads are silent corrections; blocking the
+            // picker for 45 s to wait them out would be far worse than showing
+            // the best answer so far.
+            clearResolving()
+        }
+    }
+
+    private func clearResolving() {
+        guard state.isResolvingMode else { return }
+        state.isResolvingMode = false
+        publish()
+    }
+
     public func refreshBattery() async {
         _ = try? await transport.request(.getBatteryLeft)
         _ = try? await transport.request(.getBatteryRight)
@@ -255,6 +336,9 @@ public final class DeviceController {
 
     public func connectionChanged(_ new: ConnectionState) async {
         state.connection = new
+        // Cancelled on every transition, including .ready -> .ready: a settle
+        // sequence belongs to the connection that started it.
+        settleTask?.cancel(); settleTask = nil
         if !new.isReady {
             inFlight?.cancel()
             state.pendingMode = nil
@@ -263,7 +347,19 @@ public final class DeviceController {
             state.batteryLeft = nil
             state.batteryRight = nil
         }
+        // Raised before the reads, not after: the connect read is exactly the
+        // one the UI must not present as settled truth. Assigned from
+        // `new.isReady` rather than set to `true` here and `false` in the
+        // branch above, so there is one place that decides it and no ordering
+        // to get wrong.
+        state.isResolvingMode = new.isReady
         publish()
-        if new.isReady { await refreshAfterConnect() }
+        guard new.isReady else { return }
+        await refreshAfterConnect()
+        // Started after the refresh, and only if the link is still up: the
+        // refresh takes up to ~12 s of awaits, and the buds can be back in
+        // the case by the time it returns.
+        guard state.connection.isReady else { return }
+        settleTask = Task { [weak self] in await self?.settleMode() }
     }
 }
