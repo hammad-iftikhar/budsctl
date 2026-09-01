@@ -1,1 +1,11 @@
-docs/*
+.DS_Store
+.build/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+App/Info.plist
+Controls/Info.plist
+
+# Release artifacts
+*.dmg
