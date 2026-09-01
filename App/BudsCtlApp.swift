@@ -79,15 +79,20 @@ final class AppModel {
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
-            queue: .main
+            queue: nil
         ) { [weak self] _ in
             // Deliberately synchronous, not `Task { @MainActor in ... }` like
             // the wake observer above: the process can exit immediately after
             // every `willTerminateNotification` observer returns, so this
             // publish must happen before this closure returns, not on some
-            // later run-loop turn that may never come. `queue: .main` already
-            // guarantees this runs on the main thread; `assumeIsolated` tells
-            // the compiler what is already true at runtime instead of hopping
+            // later run-loop turn that may never come. `queue: nil` is what
+            // makes that true: NotificationCenter runs a nil-queue observer
+            // synchronously, in-line, on the posting thread, instead of
+            // enqueuing it — a non-nil queue (even `.main`) delivers
+            // asynchronously and could lose the race with process exit.
+            // `willTerminateNotification` is posted on the main thread, so
+            // this closure runs there too; `assumeIsolated` tells the
+            // compiler what is already true at runtime instead of hopping
             // through an async Task that could get skipped entirely.
             MainActor.assumeIsolated {
                 guard let self else { return }
