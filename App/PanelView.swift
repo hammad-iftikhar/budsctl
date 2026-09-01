@@ -116,6 +116,17 @@ struct PanelView: View {
         }
     }
 
+    /// e.g. "v1.0 (1)". Read from the bundle, never from a constant in code:
+    /// a hardcoded string is one more thing to forget on a release, and it can
+    /// disagree with what actually shipped. `project.yml` is the only place a
+    /// version is written.
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "v\(short) (\(build))"
+    }
+
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let firmware = state.firmware {
@@ -130,9 +141,16 @@ struct PanelView: View {
             }
             .font(.callout)
 
-            Button("Quit BudsCtl") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.plain)
-                .font(.callout)
+            HStack {
+                Button("Quit BudsCtl") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain)
+                Spacer()
+                Text(appVersion)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+            }
+            .font(.callout)
         }
         .onAppear {
             // With no earbuds chosen, settings is the only useful thing here.
