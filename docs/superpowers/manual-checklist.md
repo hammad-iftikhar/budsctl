@@ -60,6 +60,31 @@ verification has happened — no agent in this build was permitted to touch
 consolidated, deduplicated hand-off list, ordered by how much of the
 architecture depends on the answer.
 
+### M1 — RESOLVED against hardware, with a caveat
+
+Plan Task 7 Step 6 said to stop if a pending `connect` did not remove the
+case-lid dance, because the agent architecture rests on it. It has now been
+tested. The result is split, and the architecture survives:
+
+- **Works:** with the app running, taking the buds out of the case connects
+  automatically, no interaction. This is the everyday path and it is why the
+  app is a login item.
+- **Does not work:** starting the app while the buds are already out and
+  settled. They stop advertising their LE service once they are just carrying
+  audio — an unfiltered 8s scan sees nothing, and `retrieveConnectedPeripherals`
+  returns nothing — so the pending connect waits for an advertisement that never
+  comes. Recovery is to case the buds and take them out again; the panel now
+  says so.
+
+A scan fallback would not help, and is not worth building: a scan cannot find a
+device that is not advertising.
+
+Still unexplained, and tracked separately: one occasion where the earbuds
+vanished from the CoreAudio output list while BudsCtl was running. Not
+reproduced. `Tools/watch-audio.sh` is there to capture the timeline if it
+recurs. Note that BLE and A2DP have since been observed coexisting happily for
+long stretches, which weakens the radio-contention theory.
+
 ### The three that matter most
 
 1. **The M1 pending-connection test — do this first.** With BudsCtl (or

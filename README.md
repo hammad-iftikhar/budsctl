@@ -41,6 +41,25 @@ swift run budsctl-cli status     # against real hardware
   single configuration, so per-mode direct controls are not implementable in
   one extension.
 
+## Connecting
+
+The earbuds advertise their BLE control service only for a window after they
+leave the case. Once they have settled into a plain audio connection they stop
+advertising entirely — verified by an unfiltered LE scan that sees nothing while
+they are happily playing music.
+
+So:
+
+- **App already running, buds taken out of the case** — connects on its own.
+  This is the normal path, and it is why the app is a login item.
+- **App started while the buds are already out and settled** — it cannot
+  connect, and shows "Waiting for earbuds". Put them in the case and take them
+  out again.
+
+A pending `connect` is left armed the whole time, so the moment the buds
+advertise again it completes with no interaction. Falling back to a scan would
+not help: a scan cannot find a device that is not advertising.
+
 ## Protocol
 
 GAIA V2 over BLE, reverse engineered for interoperability from traffic to a
