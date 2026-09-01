@@ -33,8 +33,14 @@ targets:
     sources:
       - path: App
     dependencies:
+      # embed + codeSign: the package's dynamic product lands in
+      # DerivedData/PackageFrameworks adhoc-signed. Without embedding it into
+      # Contents/Frameworks and re-signing it with our team, the app links
+      # fine and then dies at launch with "different Team IDs".
       - package: BudsKit
         product: BudsKit
+        embed: true
+        codeSign: true
       - package: KeyboardShortcuts
       - target: BudsCtlControls
         embed: true
