@@ -107,6 +107,17 @@ struct SettingsView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            // A normal working install says nothing here. This exists for the
+            // case where the App Group failed to provision: without it, the
+            // agent and the extension silently read two different stores and
+            // merely look "broken" rather than explaining why.
+            if !model.bridge.appGroupAvailable {
+                Text("Shared storage unavailable — Control Center and Shortcuts cannot see this app's state.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .task(id: model.controller.state.connection) {
             model.refreshDevices()
