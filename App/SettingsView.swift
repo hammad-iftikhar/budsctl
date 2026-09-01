@@ -101,6 +101,22 @@ struct SettingsView: View {
                     apply(wanted)
                 }
 
+            // Off by default. It buys a connection at the cost of a few
+            // seconds of silence, and nothing can tell us whether the user is
+            // mid-call when it fires, so it stays their choice to make.
+            Toggle("Reconnect automatically when BudsCtl starts", isOn: Binding(
+                get: { model.autoReconnectOnLaunch },
+                set: { model.autoReconnectOnLaunch = $0 }
+            ))
+                .toggleStyle(.checkbox)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Briefly interrupts audio. Not needed when BudsCtl is already running before you take the earbuds out.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
             if let registrationError {
                 Text(registrationError)
                     .font(.caption2)

@@ -26,10 +26,37 @@ struct PanelView: View {
             // never comes, and a scan cannot help — there is nothing to find.
             // Only the earbuds can fix it, so say how.
             if state.connection == .waiting {
-                Text("Put the earbuds in the case and take them out again to reconnect.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(model.isReconnecting
+                         ? "Reconnecting — audio will come back in a moment."
+                         : "The earbuds have stopped advertising. Reconnect below, or put them in the case and take them out.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 6) {
+                        Button("Reconnect") {
+                            Task { await model.reconnect() }
+                        }
+                        .font(.callout)
+                        .disabled(model.isReconnecting)
+
+                        if model.isReconnecting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("interrupts audio briefly")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+
+                    if let reconnectError = model.reconnectError {
+                        Text(reconnectError)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             if state.connection == .bluetoothOff {

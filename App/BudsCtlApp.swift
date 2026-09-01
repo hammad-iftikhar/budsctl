@@ -18,6 +18,12 @@ final class AppModel {
 
     var devices: [DiscoveredDevice] = []
     var isScanning = false
+    /// True while the drop-advertise-reconnect dance is in flight.
+    var isReconnecting = false
+    /// Why the last reconnect attempt got nowhere. Not written to
+    /// `DeviceState`: `DeviceController` is its sole writer, and this is the
+    /// app's problem rather than the device's.
+    var reconnectError: String?
 
     init() {
         let bridge = StateBridge.shared
@@ -54,6 +60,11 @@ final class AppModel {
         }
         // A request may have been posted while the agent was still launching.
         drainRequests()
+
+        // The earbuds stop advertising once they settle into an audio
+        // connection, so an app started after that point can never connect on
+        // its own. Give the ordinary path a chance first, then step in.
+        Task { [weak self] in await self?.autoReconnectIfAppropriate() }
 
         // onKeyUp, not onKeyDown: a held key must not queue three mode changes.
         KeyboardShortcuts.onKeyUp(for: .cycleMode) { [weak self] in
@@ -132,6 +143,69 @@ final class AppModel {
 
     func forget() {
         client.forgetDevice()
+    }
+
+    // MARK: - Reconnecting to earbuds that have stopped advertising
+
+    private static let autoReconnectKey = "autoReconnectOnLaunch"
+
+    /// Off by default, and deliberately so: it costs the user a few seconds of
+    /// silence, and there is no way to know whether they are mid-call when it
+    /// fires — every CoreAudio running flag reads `true` for a connected
+    /// Bluetooth device whether or not sound is playing.
+    var autoReconnectOnLaunch: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.autoReconnectKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.autoReconnectKey) }
+    }
+
+    /// Drop the classic link so the earbuds advertise again, let the pending
+    /// connect catch them, then put the audio back.
+    func reconnect() async {
+        guard !isReconnecting, let name = client.deviceName else { return }
+        isReconnecting = true
+        defer { isReconnecting = false }
+
+        reconnectError = nil
+        guard ClassicLink.isConnected(named: name) else {
+            // Nothing to drop, so nothing would start advertising either.
+            reconnectError = "\(name) is not connected to this Mac."
+            return
+        }
+        guard ClassicLink.disconnect(named: name) else {
+            // Most likely the sandbox refusing IOBluetooth. Say so rather than
+            // leaving a button that appears to do nothing at all.
+            reconnectError = "macOS would not let BudsCtl disconnect the earbuds."
+            return
+        }
+
+        // No connect call here: GaiaClient's pending connect has been armed
+        // since launch and completes on its own the moment they advertise.
+        let deadline = ContinuousClock.now + .seconds(12)
+        while ContinuousClock.now < deadline, !controller.state.connection.isReady {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+
+        // Always restore, even on timeout: leaving the user without an audio
+        // device because we failed to connect would be a far worse outcome
+        // than not connecting.
+        ClassicLink.restoreAudio(named: name)
+        if !controller.state.connection.isReady {
+            reconnectError = "The earbuds did not come back. Put them in the case and take them out."
+        }
+    }
+
+    /// Runs once at launch. Reconnects silently when it is free to do so, and
+    /// otherwise leaves the panel's button to the user.
+    private func autoReconnectIfAppropriate() async {
+        // Long enough for an ordinary connect to have landed on its own.
+        try? await Task.sleep(for: .seconds(6))
+        guard !controller.state.connection.isReady, let name = client.deviceName else { return }
+
+        // If the earbuds are not what the user is listening through, dropping
+        // their link costs nothing audible — safe whatever the setting says.
+        let inaudible = !ClassicLink.isCurrentAudioOutput(named: name)
+        guard inaudible || autoReconnectOnLaunch else { return }
+        await reconnect()
     }
 }
 
