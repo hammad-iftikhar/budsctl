@@ -87,6 +87,8 @@ public final class GaiaClient: NSObject, GaiaTransport {
     private static let writeTimeout: Duration = .seconds(5)
 
     private var discovered: [UUID: DiscoveredDevice] = [:]
+    /// An explicit scan request that arrived before the radio was ready.
+    private var wantsScan = false
 
     public var onConnectionChange: (@MainActor (ConnectionState) -> Void)?
     public var onDiscoveryUpdate: (@MainActor ([DiscoveredDevice]) -> Void)?
@@ -227,8 +229,27 @@ public final class GaiaClient: NSObject, GaiaTransport {
     /// Unfiltered on purpose: the GAIA service need not appear in the
     /// advertisement payload, so a service-filtered scan can miss the very
     /// device we are looking for. The settings list filters by name instead.
+    /// A caller can reach this before CoreBluetooth has reported its initial
+    /// state. `CBCentralManager` is `.unknown` for the first run-loop turns of
+    /// its life and delivers the real state asynchronously, so a scan started
+    /// in the same turn as `init` would be dropped by the guard and simply
+    /// never happen. Remember the intent instead and honour it when
+    /// `.poweredOn` lands.
+    ///
+    /// This does not weaken "never scan after first run": `wantsScan` is only
+    /// ever armed by an explicit call to this method.
     public func startScan() {
+        wantsScan = true
         guard central.state == .poweredOn else { return }
+        beginScan()
+    }
+
+    public func stopScan() {
+        wantsScan = false
+        central.stopScan()
+    }
+
+    private func beginScan() {
         // Seed with the connected devices so the list never appears to shrink
         // when a scan starts.
         discovered = Dictionary(
@@ -236,10 +257,6 @@ public final class GaiaClient: NSObject, GaiaTransport {
         )
         onDiscoveryUpdate?(discovered.values.sorted { $0.name < $1.name })
         central.scanForPeripherals(withServices: nil, options: nil)
-    }
-
-    public func stopScan() {
-        central.stopScan()
     }
 
     private func record(_ peripheral: CBPeripheral, name: String?) {
@@ -307,6 +324,8 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
             return
         }
         attemptConnect()
+        // A scan asked for before the radio was ready starts now, not never.
+        if wantsScan { beginScan() }
     }
 
     public func centralManager(
