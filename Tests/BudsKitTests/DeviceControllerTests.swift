@@ -386,6 +386,24 @@ struct DeviceControllerTests {
         controller.stop()
     }
 
+    @Test("an error from the last connection is cleared when the link comes back")
+    func reconnectClearsStaleError() async throws {
+        let (controller, _, _) = makeController(mode: .normal)
+        controller.settleReads = [.seconds(45)]
+        // makeController hands back a ready link; this test needs the buds away.
+        controller.state.connection = .waiting
+        controller.state.lastError = "Earbuds not connected"
+
+        await controller.connectionChanged(.ready)
+        #expect(controller.state.lastError == nil)
+
+        // A redundant .ready must not wipe an error the user still needs.
+        controller.state.lastError = "In use by another device"
+        await controller.connectionChanged(.ready)
+        #expect(controller.state.lastError == "In use by another device")
+        controller.stop()
+    }
+
     @Test("a set clears the loader rather than making the user wait it out")
     func settingAModeClearsResolving() async throws {
         let (controller, _, _) = makeController(mode: .normal)

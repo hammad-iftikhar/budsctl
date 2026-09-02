@@ -31,6 +31,9 @@ struct NoiseModeControl: ControlWidget {
             ControlWidgetButton(action: CycleModeIntent()) {
                 Label(snapshot.label, systemImage: snapshot.symbol)
             }
+            // Nothing to cycle with no link to the buds, and the tap would
+            // otherwise fall through to launching the agent in the foreground.
+            .disabled(!snapshot.connected)
         }
         .displayName("Earbuds Noise Mode")
         .description("Cycle between noise cancellation, transparency, and off.")
