@@ -56,8 +56,8 @@ struct StateModelTests {
     }
 
     @MainActor
-    @Test("the snapshot reflects the confirmed mode, never the optimistic one")
-    func snapshotUsesConfirmedMode() {
+    @Test("the snapshot reports the optimistic mode, flagged as pending")
+    func snapshotUsesOptimisticMode() {
         let state = DeviceState()
         state.connection = .ready
         state.mode = .normal
@@ -65,12 +65,18 @@ struct StateModelTests {
         state.batteryLeft = 85
         state.batteryRight = 90
 
-        // The widget must not be told a mode the device has not confirmed —
-        // Control Center has no way to show "in progress".
-        #expect(state.snapshot.mode == .normal)
+        // The control repaints on the target, so a tap is visible immediately
+        // instead of ~1.4 s later; `pending` is how a caller that needs a
+        // confirmed mode (SetModeIntent) still tells the two apart.
+        #expect(state.snapshot.mode == .anc)
+        #expect(state.snapshot.pending == true)
         #expect(state.snapshot.connected == true)
         #expect(state.snapshot.batteryLeft == 85)
         #expect(state.snapshot.batteryRight == 90)
+
+        state.pendingMode = nil
+        #expect(state.snapshot.mode == .normal)
+        #expect(state.snapshot.pending == false)
     }
 
     @MainActor

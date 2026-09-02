@@ -127,7 +127,10 @@ first minute and says **"Reading mode…"** rather than showing you a guess.
 - **Optimistic UI, honest UI** — a set shows immediately as `pendingMode` during the
   device's ~1.4 s apply window, but `mode` only ever holds what the device confirmed
   ([`DeviceState`](Sources/BudsKit/DeviceState.swift)). While the mode is unknown the
-  panel spins instead of presenting a guess as a selection.
+  panel spins instead of presenting a guess as a selection. The Control Center button
+  repaints on the optimistic value too, so a tap is not silent for 1.4 s; the snapshot
+  carries a `pending` flag so `SetModeIntent` still only reports success on a confirmed
+  mode.
 - **One connection, three front ends** — the app is the only process that touches
   CoreBluetooth. The Control Center extension and the Shortcuts intents talk to it
   through [`StateBridge`](Sources/BudsKit/StateBridge.swift): a snapshot the agent writes

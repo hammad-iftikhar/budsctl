@@ -83,9 +83,9 @@ public struct SetModeIntent: AppIntent {
             // snapshot to actually reflect it before telling Shortcuts this
             // worked; 3 s gives that real-world timing headroom.
             let snapshot = await bridge.waitForSnapshot(timeout: confirmationTimeout) {
-                $0.connected && $0.mode == target
+                $0.connected && !$0.pending && $0.mode == target
             }
-            guard snapshot.connected, snapshot.mode == target else {
+            guard snapshot.connected, !snapshot.pending, snapshot.mode == target else {
                 return .result(dialog: IntentDialog("BudsCtl could not reach the earbuds."))
             }
             return .result(dialog: IntentDialog("Set to \(target.label)"))

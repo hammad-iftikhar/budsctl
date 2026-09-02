@@ -146,6 +146,10 @@ public final class DeviceController {
         state.isResolvingMode = false
         inFlight?.cancel()
         state.pendingMode = target
+        // Publish before the write, not after the confirmation: this is the
+        // only thing that repaints the Control Center button, and waiting for
+        // the device made a tap look like it did nothing for ~1.4 s.
+        publish()
         inFlight = Task { [weak self] in await self?.performSet(target) }
     }
 
