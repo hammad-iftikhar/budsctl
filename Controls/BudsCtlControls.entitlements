@@ -6,7 +6,7 @@
 	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>JCXZ7458UT.com.hammadiftikhar.budsctl</string>
+		<string>$(DEVELOPMENT_TEAM).com.hammadiftikhar.budsctl</string>
 	</array>
 </dict>
 </plist>

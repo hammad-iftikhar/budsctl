@@ -13,8 +13,8 @@ settings:
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
-    MARKETING_VERSION: "1.1"
-    CURRENT_PROJECT_VERSION: "2"
+    MARKETING_VERSION: "1.2"
+    CURRENT_PROJECT_VERSION: "3"
     ENABLE_HARDENED_RUNTIME: YES
     DEAD_CODE_STRIPPING: YES
 
@@ -43,6 +43,11 @@ targets:
       - package: KeyboardShortcuts
       - target: BudsCtlControls
         embed: true
+      # Not used by App/ directly — the intents live in BudsKit. Without it
+      # appintentsmetadataprocessor skips the app target ("No AppIntents
+      # .framework dependency found"), so the app bundle ships no
+      # Metadata.appintents and only the appex carries the actions.
+      - sdk: AppIntents.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.hammadiftikhar.budsctl
@@ -78,6 +83,7 @@ targets:
       path: Controls/Info.plist
       properties:
         CFBundleDisplayName: BudsCtl Controls
-        NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)

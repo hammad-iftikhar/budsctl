@@ -146,6 +146,10 @@ public final class DeviceController {
         state.isResolvingMode = false
         inFlight?.cancel()
         state.pendingMode = target
+        // Publish before the write, not after the confirmation: this is the
+        // only thing that repaints the Control Center button, and waiting for
+        // the device made a tap look like it did nothing for ~1.4 s.
+        publish()
         inFlight = Task { [weak self] in await self?.performSet(target) }
     }
 
@@ -335,7 +339,15 @@ public final class DeviceController {
     }
 
     public func connectionChanged(_ new: ConnectionState) async {
+        let wasReady = state.connection.isReady
         state.connection = new
+        // An error belongs to the connection that produced it: "Earbuds not
+        // connected" from a set attempted while they were away outlived the
+        // reconnect and sat there next to a green dot until the next set.
+        // Only on a readiness *change*, so a redundant .ready -> .ready cannot
+        // wipe a live "In use by another device". Cleared before
+        // `refreshAfterConnect()`, which is what raises the firmware warning.
+        if new.isReady != wasReady { state.lastError = nil }
         // Cancelled on every transition, including .ready -> .ready: a settle
         // sequence belongs to the connection that started it.
         settleTask?.cancel(); settleTask = nil

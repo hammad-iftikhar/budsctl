@@ -1,10 +1,13 @@
 import Foundation
 
 public enum BudsCtl {
+    /// The one place the team is named in Swift. The entitlements files derive
+    /// their App Group from `$(DEVELOPMENT_TEAM)` in project.yml, so changing
+    /// teams means changing it there and here — not in four files.
     public static let teamID = "JCXZ7458UT"
     public static let appBundleID = "com.hammadiftikhar.budsctl"
     public static let extensionBundleID = "com.hammadiftikhar.budsctl.controls"
-    public static let appGroupID = "JCXZ7458UT.com.hammadiftikhar.budsctl"
+    public static let appGroupID = "\(teamID).\(appBundleID)"
 
     /// Darwin notification the extension posts to nudge the agent. Carries no
     /// payload and coalesces — the App Group defaults write is the real channel.

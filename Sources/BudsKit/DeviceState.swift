@@ -59,12 +59,18 @@ public final class DeviceState {
         displayMode?.symbol ?? "ear"
     }
 
-    /// Cheap, Sendable projection for the widget extension. Reports only the
-    /// confirmed mode — Control Center cannot render "in progress".
+    /// Cheap, Sendable projection for the widget extension.
+    ///
+    /// Reports the *optimistic* mode, like the menu bar: waiting for the
+    /// device's ~1.4 s confirmation before repainting made every Control
+    /// Center tap feel broken. `pending` carries the distinction for callers
+    /// that need the truth — `SetModeIntent` must not report success off an
+    /// optimistic value.
     public var snapshot: ModeSnapshot {
         ModeSnapshot(
-            mode: mode,
+            mode: displayMode,
             connected: connection.isReady,
+            pending: isBusy,
             batteryLeft: batteryLeft,
             batteryRight: batteryRight
         )
@@ -75,17 +81,26 @@ public final class DeviceState {
 public struct ModeSnapshot: Codable, Sendable, Equatable {
     public var mode: ANCMode?
     public var connected: Bool
+    /// `mode` is a target we have asked for, not one the device has confirmed.
+    ///
+    /// ponytail: synthesized Decodable ignores this default, so a snapshot
+    /// written by a pre-`pending` agent fails to decode and reads as
+    /// disconnected until the agent's next publish — seconds, after an app
+    /// update only. Write a custom init(from:) if that ever matters.
+    public var pending: Bool = false
     public var batteryLeft: Int?
     public var batteryRight: Int?
 
     public init(
         mode: ANCMode?,
         connected: Bool,
+        pending: Bool = false,
         batteryLeft: Int? = nil,
         batteryRight: Int? = nil
     ) {
         self.mode = mode
         self.connected = connected
+        self.pending = pending
         self.batteryLeft = batteryLeft
         self.batteryRight = batteryRight
     }
