@@ -104,6 +104,21 @@ open /Applications/BudsCtl.app
 
 `project.yml` is the source of truth; `BudsCtl.xcodeproj`, `App/Info.plist` and `Controls/Info.plist` are build artifacts and are not committed.
 
+### Building under your own team
+
+The build is tied to an Apple **Team ID** `JCXZ7458UT` here and a fork has to change it. Not for signing's sake, the menu bar agent and the Control Center extension are two sandboxed processes, and the only way they can share state is an **App Group**, whose ID macOS requires to be `<TeamID>.<something>` and checks against the signature at launch. If you add wrong prefix, the two processes quietly read different stores. App says *"Shared storage unavailable"* in Settings and Control Center shows nothing while the menu bar keeps working.
+
+Two lines to change:
+
+| Where | What |
+| --- | --- |
+| [`project.yml`](project.yml) | `DEVELOPMENT_TEAM:` your 10-character Team ID |
+| [`Identifiers.swift`](Sources/BudsKit/Identifiers.swift) | `teamID` the same value, for the Swift side |
+
+The entitlements files name no team at all: they derive the group from `$(DEVELOPMENT_TEAM)`, expanded at build time. (Deliberately not the more familiar
+`$(TeamIdentifierPrefix)` that one is populated from a provisioning profile, and this app embeds none, so it would expand to empty and break the App Group silently.) A free
+Apple ID is enough to build and run it yourself; see [Install](#install) for what it is *not* enough for.
+
 ### Test
 
 ```sh
