@@ -78,6 +78,7 @@ targets:
       path: Controls/Info.plist
       properties:
         CFBundleDisplayName: BudsCtl Controls
-        NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
