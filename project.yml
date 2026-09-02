@@ -43,6 +43,11 @@ targets:
       - package: KeyboardShortcuts
       - target: BudsCtlControls
         embed: true
+      # Not used by App/ directly — the intents live in BudsKit. Without it
+      # appintentsmetadataprocessor skips the app target ("No AppIntents
+      # .framework dependency found"), so the app bundle ships no
+      # Metadata.appintents and only the appex carries the actions.
+      - sdk: AppIntents.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.hammadiftikhar.budsctl

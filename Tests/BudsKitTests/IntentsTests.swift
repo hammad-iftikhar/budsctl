@@ -138,15 +138,31 @@ struct IntentsTests {
     @Test("a cycle intent leaves a cycle request")
     func cycleIntentPostsRequest() async throws {
         let bridge = scratchBridge()
-        var intent = CycleModeIntent()
+        bridge.publish(ModeSnapshot(mode: .normal, connected: true))
+        var intent = CycleNoiseModeIntent()
         intent.injectedBridge = bridge
-        let taken = Box<BridgeRequest?>(nil)
-        Task {
-            try? await Task.sleep(for: .milliseconds(50))
-            taken.value = bridge.takeRequest()
-        }
-        _ = try await intent.perform()
-        #expect(taken.value == .cycleMode)
+
+        // No agent simulated, and none needed: perform() must not wait for one.
+        // Anything it waits for shows up in Spotlight as a running-progress UI.
+        let start = ContinuousClock.now
+        let result = try await intent.perform()
+        #expect(start.duration(to: .now) < .milliseconds(50))
+
+        #expect(bridge.takeRequest() == .cycleMode)
+        // Reports the target it asked for, by the same `next` rule the agent uses.
+        #expect(dialogText(result).contains("Noise Cancellation"))
+    }
+
+    @Test("a cycle intent reports honestly when the earbuds are not connected")
+    func cycleIntentReportsDisconnected() async throws {
+        let bridge = scratchBridge()
+        bridge.publish(ModeSnapshot(mode: .anc, connected: false))
+        var intent = CycleNoiseModeIntent()
+        intent.injectedBridge = bridge
+        let result = try await intent.perform()
+        #expect(dialogText(result).contains("BudsCtl is not connected to your earbuds."))
+        // Still posted, so it applies once the agent has a link.
+        #expect(bridge.takeRequest() == .cycleMode)
     }
 
     @Test("a get intent reads the published snapshot and posts nothing")

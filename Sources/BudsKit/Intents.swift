@@ -36,27 +36,25 @@ public enum ANCModeAppEnum: String, AppEnum {
     }
 }
 
-/// Neither this intent nor `CycleModeIntent` conforms to `ForegroundContinuableIntent`:
-/// on the macOS 26.5 SDK that protocol, and `requestToContinueInForeground()`, are
-/// deprecated in favor of `AppIntent.continueInForeground(_:alwaysConfirm:)`, which
-/// is available on every `AppIntent` with no protocol conformance needed. Using the
-/// deprecated pair here would build clean today but leave a warning-free build
-/// commitment resting on soon-to-be-removed API for no behavioral difference.
+/// Neither this intent nor `CycleNoiseModeIntent` asks to continue in the foreground,
+/// and neither declares `.foreground(.dynamic)`.
 ///
-/// `continueInForeground()` is gated on `supportedModes` declaring
-/// `.foreground(.dynamic)` — the deprecation message on `ForegroundContinuableIntent`
-/// names this as the replacement mechanism, and `IntentModes.Current.canContinueInForeground`
-/// strongly implies the runtime checks it. Declared below on both intents; not
-/// verified at runtime (needs a GUI session — see the task report).
+/// They used to. `continueInForeground()` is gated on that declaration, and it was
+/// there to launch the agent from a cold start. The cost turned out to be real:
+/// declaring foreground support forces the intent to run in the app rather than in
+/// the control extension, and this app is `LSUIElement` — no window, nothing for
+/// Shortcuts' dialog presenter to attach to. Run from Spotlight, `perform()`
+/// succeeded and the run then died in a modal reading "Unsupported".
+/// `GetBatteryIntent`, which declares nothing and defaults to `.background`, ran
+/// clean in the extension throughout.
+///
+/// Nothing is lost on the cold-start path: the request is already in the App Group
+/// by then, and the agent drains pending requests on launch, so it applies as soon
+/// as BudsCtl is opened. The intent now says so instead of trying to force it.
 public struct SetModeIntent: AppIntent {
     public static let title: LocalizedStringResource = "Set Noise Mode"
     public static let description = IntentDescription("Set the earbuds' noise mode.")
     public static var openAppWhenRun: Bool { false }
-    // The SDK's replacement for ForegroundContinuableIntent: continueInForeground()
-    // is gated on the intent declaring that it may run in the foreground.
-    // .background is what we normally want (post to the running agent and return);
-    // .foreground(.dynamic) is what permits the cold-start launch.
-    public static var supportedModes: IntentModes { [.background, .foreground(.dynamic)] }
 
     @Parameter(title: "Mode")
     public var mode: ANCModeAppEnum
@@ -73,7 +71,9 @@ public struct SetModeIntent: AppIntent {
 
     public init() {}
 
-    public func perform() async throws -> some IntentResult & ProvidesDialog {
+    /// See `CycleNoiseModeIntent.perform()` for why this returns a value and not
+    /// only a dialog.
+    public func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
         let target = mode.asANCMode
         let seq = bridge.postRequest(.setMode(target))
         if await bridge.waitForHandling(of: seq, timeout: .seconds(2)) {
@@ -86,39 +86,75 @@ public struct SetModeIntent: AppIntent {
                 $0.connected && !$0.pending && $0.mode == target
             }
             guard snapshot.connected, !snapshot.pending, snapshot.mode == target else {
-                return .result(dialog: IntentDialog("BudsCtl could not reach the earbuds."))
+                let failure = "BudsCtl could not reach the earbuds."
+                return .result(value: failure, dialog: IntentDialog(stringLiteral: failure))
             }
-            return .result(dialog: IntentDialog("Set to \(target.label)"))
+            return .result(value: "Set to \(target.label)", dialog: IntentDialog("Set to \(target.label)"))
         }
-        // Nothing picked the request up, so the agent is not running. Launch
-        // it — it drains pending requests on start, so the original request
-        // still applies and must not be re-posted.
-        try await continueInForeground()
-        return .result(dialog: IntentDialog("Starting BudsCtl…"))
+        // Nothing picked the request up, so the agent is not running. The
+        // request stays in the App Group and the agent drains it on launch, so
+        // it must not be re-posted — say so rather than pretending it applied.
+        let idle = "BudsCtl is not running. Open it and this will apply."
+        return .result(value: idle, dialog: IntentDialog(stringLiteral: idle))
     }
 }
 
-public struct CycleModeIntent: AppIntent {
+/// Renamed from `CycleModeIntent`, and the rename is the fix.
+///
+/// The AppIntents identifier is the type name, and every Spotlight run of the
+/// old name ended in a modal reading "Unsupported" — with no dialog returned,
+/// with a dialog, with a value, with both, at 2 ms and at 105 ms, hosted in the
+/// app and in the extension. `ProbeWriteIntent`, a throwaway type with the same
+/// body and result shape, ran clean on its first try. The difference was never
+/// in the code: WorkflowKit stores a `ShowWhenRun` state per action identifier,
+/// it was on for this one, and the result panel it then presents does not
+/// render. Nothing in our reach clears that record — the store is SIP-protected
+/// — so the identifier is abandoned.
+///
+/// Cost: a saved shortcut built against `CycleModeIntent` breaks and has to be
+/// re-added. Acceptable here, where none exist.
+public struct CycleNoiseModeIntent: AppIntent {
     public static let title: LocalizedStringResource = "Cycle Noise Mode"
     public static let description = IntentDescription(
         "Move to the next noise mode: off, then noise cancellation, then transparency."
     )
     public static var openAppWhenRun: Bool { false }
-    // See SetModeIntent's supportedModes comment.
-    public static var supportedModes: IntentModes { [.background, .foreground(.dynamic)] }
 
     public var injectedBridge: StateBridge?
     private var bridge: StateBridge { injectedBridge ?? .shared }
 
     public init() {}
 
-    public func perform() async throws -> some IntentResult {
-        let seq = bridge.postRequest(.cycleMode)
-        if await bridge.waitForHandling(of: seq, timeout: .seconds(2)) {
-            return .result()
+    /// Returns without awaiting anything, and that is the point.
+    ///
+    /// It used to wait for the agent to take the request (~105 ms). Run from
+    /// Spotlight that was enough for Shortcuts to decide the action was slow
+    /// (`shortcutShouldShowRunningProgress: 1`) and stand up its
+    /// running-progress UI, which then died in a modal reading "Unsupported".
+    /// `GetModeIntent` (0.1 ms) and `GetBatteryIntent` (25 ms) were identical
+    /// in every other respect — same result shape, same dialog construction,
+    /// same side-effect verdict — and never showed it.
+    ///
+    /// So the mode reported here is the one we are asking for, computed by the
+    /// same rule the agent uses in `DeviceController.cycleMode`: the published
+    /// snapshot already carries the optimistic mode, so both sides agree on
+    /// what `next` is. Honesty comes from `connected` instead of from waiting —
+    /// a request posted while the agent is down still applies when it starts,
+    /// but this does not claim otherwise in the meantime.
+    /// Value plus dialog, the shape `GetModeIntent` and `GetBatteryIntent` have
+    /// always used without trouble.
+    public func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
+        let snapshot = bridge.readSnapshot()
+        bridge.postRequest(.cycleMode)
+        guard snapshot.connected else {
+            let idle = "BudsCtl is not connected to your earbuds."
+            return .result(value: idle, dialog: IntentDialog(stringLiteral: idle))
         }
-        try await continueInForeground()
-        return .result()
+        // The target, not a reading: the agent applies `next` to the same
+        // published snapshot in `DeviceController.cycleMode`, so both agree.
+        let target = (snapshot.mode ?? .normal).next
+        let text = "Noise mode is now \(target.label)"
+        return .result(value: text, dialog: IntentDialog(stringLiteral: text))
     }
 }
 
