@@ -32,7 +32,15 @@
 Both are simplifications found while writing the plan. They are called out so a reviewer does not read them as drift.
 
 1. **`EarbudsBackend` has no `isLikelyMatch(_:)` method.** The spec put it on the protocol. It is instead a stored `let isLikelyMatch: Bool` on `DiscoveredDevice`, set by whichever backend found the device. Same behaviour, one less protocol member, and it keeps working when devices from two backends are merged into one list.
-2. **`EarbudsBackend` has three refresh hooks, not two.** The spec listed `refreshMode()` and `refreshBattery()`. A third, `refresh()`, is needed because `DeviceController.refreshAfterConnect` and `refreshOnWake` mean "read everything", which for GAIA includes firmware — a read neither of the other two names honestly covers. Each hook has exactly one caller: `refresh()` from connect and wake, `refreshMode()` from the settle loop, `refreshBattery()` from the battery poll.
+2. **`EarbudsBackend` has three refresh hooks, not two.** The spec listed `refreshMode()` and `refreshBattery()`. A third, `refresh()`, is needed because `DeviceController.refreshAfterConnect` means "read everything", which for GAIA includes firmware — a read neither of the other two names honestly covers. Each hook has exactly one caller, and keeping them separate is load-bearing rather than tidy:
+
+| Hook | Called from | GAIA | Samsung |
+| --- | --- | --- | --- |
+| `refresh()` | `refreshAfterConnect` | firmware + mode + battery | **nothing** — state is already being pushed |
+| `refreshMode()` | `refreshOnWake`, settle loop | `getMode` | reopen the channel to re-trigger the push |
+| `refreshBattery()` | `refreshOnWake`, battery poll | both battery getters | nothing — battery is pushed |
+
+`refreshOnWake` uses the narrow two rather than `refresh()`, which both restores its original behaviour exactly (it never read firmware) and prevents a reconnect loop: the only method that may tear down and rebuild a link is one nothing in the connect path calls.
 
 ---
 
@@ -1540,6 +1548,7 @@ The riskiest task. `DeviceController` holds every hard-won concurrency fix in th
 **Files:**
 - Modify: `Sources/BudsKit/DeviceController.swift`
 - Modify: `Tests/BudsKitTests/DeviceControllerTests.swift`
+- Modify: `Sources/BudsKit/Device/EarbudsBackend.swift` — one doc comment only (see Step 3)
 
 **Interfaces:**
 - Consumes: `EarbudsBackend`, `DeviceEvent`, `BackendPolicy` (Task 3); `GaiaBackend` (Task 5).
@@ -1738,9 +1747,22 @@ Add the helper. It replaces `GaiaTransport.request(.getMode)` and keeps that met
     }
 
     /// After wake, the link usually survives but the state may be stale.
+    ///
+    /// Deliberately `refreshMode()` + `refreshBattery()` rather than
+    /// `refresh()`, which restores this method's original behaviour exactly
+    /// (it read the mode and both batteries, never the firmware) — and, more
+    /// importantly, breaks a reconnect loop.
+    ///
+    /// `refresh()` is the *connect* hook. On a device that pushes its state
+    /// when a link comes up, prompting it means tearing the link down and
+    /// rebuilding it, which re-fires `connectionChanged(.ready)` and calls
+    /// `refreshAfterConnect` again — forever. Keeping the wake path on the
+    /// narrower hooks means the only method that may reopen a link is one
+    /// nothing in the connect path calls.
     public func refreshOnWake() async {
         guard state.connection.isReady else { return }
-        await backend.refresh()
+        await backend.refreshMode()
+        await backend.refreshBattery()
     }
 ```
 
@@ -1778,6 +1800,20 @@ In `connectionChanged`, add a guard so a pushing device never starts a settle se
 ```
 
 `clearResolving()` is already private in this file and already publishes only on a real change; reuse it rather than assigning the flag here.
+
+**One doc-comment fix in `Sources/BudsKit/Device/EarbudsBackend.swift`.** Task 3 shipped `refreshMode()` documented as "Called only by the settle loop, so only reachable when `policy.settleReads` is non-empty." That is no longer true — `refreshOnWake` calls it too, and for the Samsung backend that is its *only* caller. Replace that comment with:
+
+```swift
+    /// Re-read just the mode.
+    ///
+    /// Called from `DeviceController.refreshOnWake()`, and from the settle loop
+    /// when `policy.settleReads` is non-empty. This — never `refresh()` — is
+    /// where a backend may tear a link down and rebuild it, because nothing in
+    /// the connect path calls it.
+    func refreshMode() async
+```
+
+Change nothing else in that file.
 
 - [ ] **Step 4: Add `use`**
 
@@ -2545,26 +2581,40 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         try await send(.noiseControls, [mode.rawValue])
     }
 
-    /// Reopens the channel.
+    /// Deliberately does nothing.
+    ///
+    /// This is the *connect* hook, and on connect there is nothing to ask for:
+    /// the buds push `EXTENDED_STATUS_UPDATED` — mode and both batteries — the
+    /// moment the channel opens. It is already on its way before this is
+    /// called.
+    ///
+    /// **Do not make this reopen the channel.** Reopening re-fires
+    /// `rfcommChannelOpenComplete` → `report(.ready)` →
+    /// `DeviceController.connectionChanged(.ready)` → `refreshAfterConnect()` →
+    /// here, which is an infinite reconnect loop. The channel reopen lives in
+    /// `refreshMode()`, which nothing in the connect path calls.
+    public func refresh() async {}
+
+    /// Reopens the channel — the wake path's lever, and the only one there is.
     ///
     /// No message requests `EXTENDED_STATUS_UPDATED`; the buds send it when the
-    /// channel opens, so reopening is the only lever. Cheaper than it sounds —
-    /// SPP is a control channel and A2DP audio runs independently, so the user
-    /// hears nothing.
+    /// channel opens, so reopening is the only way to ask "what is your state
+    /// now?". Cheaper than it sounds: SPP is a control channel and A2DP audio
+    /// runs independently, so the user hears nothing.
+    ///
+    /// Reached only from `DeviceController.refreshOnWake()` — `policy.settleReads`
+    /// is empty, so the settle loop never runs for this backend. That single
+    /// caller is what keeps it out of the connect path, and out of the loop
+    /// described on `refresh()` above.
     ///
     /// ponytail: the blunt instrument. If a firmware ever answers message 97 as
     /// a request, send that instead and keep the channel up.
-    public func refresh() async {
+    public func refreshMode() async {
         guard adopted != nil else { return }
         closeChannel()
         openAttempt = 0
         await openLink()
     }
-
-    /// Never called: `policy.settleReads` is empty, because the buds push their
-    /// state on connect. Implemented as `refresh()` rather than left empty so
-    /// it is not a lie if a future policy change reaches it.
-    public func refreshMode() async { await refresh() }
 
     /// Never called: `policy.batteryInterval` is nil, because the buds push
     /// `STATUS_UPDATED` on every battery change.
