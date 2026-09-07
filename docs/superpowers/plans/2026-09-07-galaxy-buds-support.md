@@ -16,7 +16,7 @@
 - macOS deployment target `26.0`.
 - **No new package dependencies.** IOBluetooth ships in the macOS SDK.
 - Tests use swift-testing, not XCTest. Run with `swift test`.
-- **Baseline is 78 tests in 6 suites at branch start.** Running totals as tasks land: T1 → 84/7, T2 → 105/9, T5 → 116/10, T6 → 118/10, T7 → 132/12. Later tasks add no tests. Each task's brief states its own expected total; trust the count of `@Test` functions in the brief's code over any prose number. Every task must end with the full suite green. Task 6 is the only task that may edit existing test bodies, and it must not delete or weaken an assertion.
+- **Baseline is 78 tests in 6 suites at branch start.** Running totals as tasks land: T1 → 84/7, T2 → 105/9, T5 → 116/10, T6 → 118/10, T7 → 132/11. Later tasks add no tests. Each task's brief states its own expected total; trust the count of `@Test` functions in the brief's code over any prose number. Every task must end with the full suite green. Task 6 is the only task that may edit existing test bodies, and it must not delete or weaken an assertion.
 - **`ModeSnapshot`, `BridgeRequest`, the App Group keys, the Darwin notification name, and all four App Intents are frozen.** They are cross-process contracts; an installed appex older than the agent must keep working.
 - `ANCMode` keeps exactly three cases (`normal = 0`, `anc = 1`, `passthrough = 2`). Adaptive mode (`3`) is out of scope and must be dropped on receipt, never displayed.
 - Case battery is out of scope. Read and discarded.
@@ -2219,7 +2219,7 @@ private enum ExtendedStatusNotes {}
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `swift test --filter SppEvents 2>&1 | tail -10`
-Expected: PASS, **14 tests**. Running total after this task: **132 tests / 12 suites**.
+Expected: PASS, **14 tests**. Running total after this task: **132 tests / 11 suites** (this task adds one suite, not two).
 
 Run: `swift test 2>&1 | tail -5` — all green.
 
