@@ -1545,6 +1545,8 @@ The riskiest task. `DeviceController` holds every hard-won concurrency fix in th
 
 **The bar: all existing `DeviceControllerTests` assertions keep passing, unedited except for how the controller is constructed and how the settle schedule is set.** Do not delete or weaken an assertion. If one cannot pass, stop and report it rather than adjusting it.
 
+**One deliberate behaviour change**, and the only one in this task: the event loop gains a `!Task.isCancelled` guard it did not have. That is a latent bug fix, not a refactor artifact — see the comment in Step 2. Everything else must behave exactly as it does today.
+
 **Files:**
 - Modify: `Sources/BudsKit/DeviceController.swift`
 - Modify: `Tests/BudsKitTests/DeviceControllerTests.swift`
@@ -1589,7 +1591,19 @@ Delete the `settleReads` and `batteryInterval` stored properties. Their document
         // hop and no await.
         frameTask = Task { [weak self] in
             for await event in stream {
-                guard let self else { return }
+                // `!Task.isCancelled` is load-bearing, and it is new here.
+                // `AsyncStream`'s iteration does not itself observe
+                // cancellation: an element already buffered when `stop()` ran
+                // resumes this loop anyway. Demonstrated — three events
+                // buffered before `cancel()` all reached the body without this
+                // guard, and none reached it with the guard.
+                //
+                // It matters most for `use(_:)`. Switching device families
+                // calls `stop()` and then clears the readings; an event
+                // buffered from the *previous* pair of earbuds would otherwise
+                // land in `DeviceState` on a later main-actor turn, after the
+                // clear, and be shown as this device's mode or battery.
+                guard let self, !Task.isCancelled else { return }
                 self.apply(event)
             }
         }
