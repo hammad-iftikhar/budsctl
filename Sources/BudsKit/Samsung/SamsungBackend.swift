@@ -256,7 +256,10 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
             }
         }
 
-        // Captured before the suspension point below.
+        // Captured before the suspension point below. `adopted` here is the
+        // non-optional local bound by the `guard let` above, so every re-check
+        // after an await must say `self.adopted` — comparing the local would be
+        // comparing `intended` to itself.
         let intended = adopted
 
         // Unfiltered on purpose: an SDP query with UUIDs specified silently
@@ -272,9 +275,23 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         // resumed call opens a channel to a device the user has already left,
         // assigns it to `self.channel` (making every identity guard downstream
         // pass), and the newly selected earbuds never connect.
-        guard adopted == intended, channel == nil else {
+        guard self.adopted == intended, channel == nil else {
             // `self.` because the local `let device` shadows the property here.
             self.device = nil
+            // A *different* device was adopted while this call was suspended.
+            // Its own `openLink()` was swallowed by `isOpening`, and there may
+            // be no later trigger to rescue it — `register(forConnectNotifications:)`
+            // fires on a baseband connect, which has already happened for buds
+            // that are still linked. So drive it here, as this call unwinds.
+            //
+            // Safe against a switch to another *backend*: `AppModel.select`
+            // calls `disconnect()` on the backends it did not pick, which nils
+            // `adopted`, so the condition below is false and nothing is driven.
+            // Scheduled rather than awaited so `isOpening`'s `defer` has run by
+            // the time it executes.
+            if let current = self.adopted, current != intended {
+                Task { [weak self] in await self?.openLink() }
+            }
             return
         }
 
@@ -300,10 +317,16 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         }
         // `openRFCOMMChannelAsync` is another window on the same hazard: it can
         // return having already run the main run loop.
-        guard adopted == intended, channel == nil else {
+        guard self.adopted == intended, channel == nil else {
             opened.setDelegate(nil)
             opened.close()
             self.device = nil
+            // Same situation one step later, so the same re-drive — see the
+            // post-SDP bail-out above for why it is needed and why a backend
+            // switch cannot trigger it.
+            if let current = self.adopted, current != intended {
+                Task { [weak self] in await self?.openLink() }
+            }
             return
         }
         channel = opened
