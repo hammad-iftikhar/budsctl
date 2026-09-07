@@ -154,8 +154,12 @@ public protocol EarbudsBackend: AnyObject {
     /// whatever re-triggers that push.
     func refresh() async
 
-    /// Re-read just the mode. Called only by the settle loop, so only reachable
-    /// when `policy.settleReads` is non-empty.
+    /// Re-read just the mode.
+    ///
+    /// Called from `DeviceController.refreshOnWake()`, and from the settle loop
+    /// when `policy.settleReads` is non-empty. This — never `refresh()` — is
+    /// where a backend may tear a link down and rebuild it, because nothing in
+    /// the connect path calls it.
     func refreshMode() async
 
     /// Re-read just the battery. Called only by the battery poll, so only

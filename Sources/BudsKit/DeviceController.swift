@@ -12,7 +12,8 @@ public final class DeviceController {
 
     public let state = DeviceState()
 
-    private let transport: GaiaTransport
+    /// The device family currently driving this controller. Swapped by `use`.
+    private var backend: any EarbudsBackend
     private let bridge: StateBridge
     private let onStateChanged: @MainActor @Sendable () -> Void
 
@@ -30,41 +31,49 @@ public final class DeviceController {
 
     /// How long to wait for the device's unsolicited confirmation.
     public var setTimeout: Duration = .seconds(3)
-    /// Battery refresh interval while connected.
-    public var batteryInterval: Duration = .seconds(300)
-    /// When to re-read the mode, as offsets from the moment the connection
-    /// landed — not gaps between reads. See `settleMode`.
-    public var settleReads: [Duration] = [
-        .seconds(2), .seconds(5), .seconds(10), .seconds(20), .seconds(45),
-    ]
 
     public init(
-        transport: GaiaTransport,
+        backend: any EarbudsBackend,
         bridge: StateBridge,
         onStateChanged: @escaping @MainActor @Sendable () -> Void = {}
     ) {
-        self.transport = transport
+        self.backend = backend
         self.bridge = bridge
         self.onStateChanged = onStateChanged
     }
 
     // MARK: - Lifecycle
 
-    /// Begin consuming device frames. Idempotent.
+    /// Begin consuming device events. Idempotent.
     public func start() {
         guard frameTask == nil else { return }
-        let stream = transport.frames()
+        let stream = backend.events()
         // Task inherits this method's MainActor isolation, so `apply` needs no
         // hop and no await.
         frameTask = Task { [weak self] in
-            for await frame in stream {
-                guard let self else { return }
-                self.apply(frame)
+            for await event in stream {
+                // `!Task.isCancelled` is load-bearing, and it is new here.
+                // `AsyncStream`'s iteration does not itself observe
+                // cancellation: an element already buffered when `stop()` ran
+                // resumes this loop anyway. Demonstrated — three events
+                // buffered before `cancel()` all reached the body without this
+                // guard, and none reached it with the guard.
+                //
+                // It matters most for `use(_:)`. Switching device families
+                // calls `stop()` and then clears the readings; an event
+                // buffered from the *previous* pair of earbuds would otherwise
+                // land in `DeviceState` on a later main-actor turn, after the
+                // clear, and be shown as this device's mode or battery.
+                guard let self, !Task.isCancelled else { return }
+                self.apply(event)
             }
         }
+        // Only for devices that do not announce their battery. Galaxy Buds push
+        // STATUS_UPDATED on every change, so polling them would be two writes
+        // every five minutes for information already in hand.
+        guard let interval = backend.policy.batteryInterval else { return }
         batteryTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let interval = self?.batteryInterval else { return }
                 try? await Task.sleep(for: interval)
                 // Sleep returns early when cancelled, so check before doing
                 // any work: otherwise a cancelled task still issues one last
@@ -73,7 +82,7 @@ public final class DeviceController {
                 guard !Task.isCancelled else { return }
                 guard let self else { return }
                 guard self.state.connection.isReady else { continue }
-                await self.refreshBattery()
+                await self.backend.refreshBattery()
             }
         }
     }
@@ -93,26 +102,50 @@ public final class DeviceController {
         writeOrder?.cancel(); writeOrder = nil
     }
 
-    // MARK: - Inbound frames
+    /// Switch to a different device family.
+    ///
+    /// Only called when the user selects a device on the other radio; a
+    /// selection within the same family goes straight to `adopt`, which already
+    /// releases the previous peripheral.
+    ///
+    /// Clears the readings rather than keeping them: unlike a reconnect, where
+    /// the last mode the device reported is still the best information we have,
+    /// a mode read from a *different* pair of earbuds is not information about
+    /// this one.
+    public func use(_ backend: any EarbudsBackend) {
+        stop()
+        self.backend = backend
+        state.mode = nil
+        state.pendingMode = nil
+        state.batteryLeft = nil
+        state.batteryRight = nil
+        state.firmware = nil
+        state.lastError = nil
+        start()
+    }
 
-    private func apply(_ frame: GaiaFrame) {
-        switch frame.command {
-        case .getMode:
-            guard let mode = frame.mode else { return }
+    // MARK: - Inbound events
+
+    private func apply(_ event: DeviceEvent) {
+        switch event {
+        case .mode(let mode):
             state.mode = mode
             if state.pendingMode == mode { state.pendingMode = nil }
             publish()
 
-        case .getBatteryLeft:
-            state.batteryLeft = frame.percent
+        case .batteryLeft(let percent):
+            state.batteryLeft = percent
             publish()
 
-        case .getBatteryRight:
-            state.batteryRight = frame.percent
+        case .batteryRight(let percent):
+            state.batteryRight = percent
             publish()
 
-        case .getFirmware:
-            guard let firmware = frame.ascii else { return }
+        case .firmware(let firmware):
+            // Only the GAIA family emits this. Left as a plain check rather than a
+            // per-backend "known good firmware" policy field: one device reports a
+            // version, so a policy field would be configuration for a value that
+            // never varies.
             state.firmware = firmware
             if !firmware.contains(BudsCtl.knownGoodFirmware) {
                 state.lastError = "Untested firmware (\(firmware)). Modes may not respond."
@@ -122,9 +155,6 @@ public final class DeviceController {
             // publish is gone, so without this the firmware string and its
             // warning would never reach the UI or the bridge.
             publish()
-
-        case .setMode:
-            break   // never echoed back by this device
         }
     }
 
@@ -169,7 +199,7 @@ public final class DeviceController {
     private func performSet(_ target: ANCMode) async {
         // Subscribe before writing. The confirmation is unsolicited and can
         // arrive before a later-started listener would exist.
-        let stream = transport.frames()
+        let stream = backend.events()
 
         // The write itself is chained onto the previous write, not onto the
         // previous *wait*: `transport.write` is a fast, synchronous hand-off,
@@ -180,10 +210,10 @@ public final class DeviceController {
         // only cancels the (potentially seconds-long) confirmation wait
         // below, on purpose, so the write must not depend on it either.
         let previousWrite = writeOrder
-        let thisWrite = Task { [transport] in
+        let thisWrite = Task { [backend] in
             _ = await previousWrite?.value
             do {
-                try await transport.write(.setMode, payload: [target.rawValue])
+                try await backend.setMode(target)
                 return true
             } catch {
                 return false
@@ -208,7 +238,7 @@ public final class DeviceController {
         }
 
         let confirmed = await withTimeout(setTimeout) {
-            for await frame in stream where frame.mode == target { return true }
+            for await event in stream where event == .mode(target) { return true }
             return false
         } ?? false
 
@@ -228,13 +258,13 @@ public final class DeviceController {
         // The set may have been silently lost. Read the truth once, then stop.
         // Reconcile and clear the optimistic state in the same turn: anything
         // that sees `isBusy` go false must already be looking at the settled mode.
-        let reconciled = try? await transport.request(.getMode)
+        let reconciled = await readMode(timeout: setTimeout)
         // Re-checked after the await, not only before it: a superseded set that
         // resumes here must not write `state.mode` from its own read, nor flash
         // "did not change mode" over a newer set that already succeeded.
         guard !Task.isCancelled else { return }
         if state.pendingMode == target { state.pendingMode = nil }
-        if let actual = reconciled?.mode {
+        if let actual = reconciled {
             state.mode = actual
             state.lastError = actual == target ? nil : "The earbuds did not change mode"
         } else {
@@ -243,15 +273,28 @@ public final class DeviceController {
         publish()
     }
 
+    /// Ask the device for its mode and wait for the answer.
+    ///
+    /// The stream is opened before the read is triggered. Opening it after
+    /// would drop an answer that arrives faster than we can subscribe — the
+    /// same class of bug as writing before the notify subscription lands.
+    private func readMode(timeout: Duration) async -> ANCMode? {
+        let stream = backend.events()
+        await backend.refreshMode()
+        let raced: ANCMode?? = await withTimeout(timeout) { () -> ANCMode? in
+            for await event in stream {
+                if case .mode(let mode) = event { return mode }
+            }
+            return nil
+        }
+        return raced ?? nil
+    }
+
     // MARK: - Refreshes
 
     /// Run once per connection, after the notify subscription has landed.
     public func refreshAfterConnect() async {
-        // Replies are handled by `apply` via the frame stream; the return
-        // values are ignored on purpose so there is one code path into state.
-        _ = try? await transport.request(.getFirmware)
-        _ = try? await transport.request(.getMode)
-        await refreshBattery()
+        await backend.refresh()
         // Nothing at the tail on purpose. `connectionChanged` already set and
         // published `.ready` before calling this, and it is the sole writer of
         // `state.connection`. Re-asserting `.ready` here after up to ~12 s of
@@ -301,7 +344,7 @@ public final class DeviceController {
         // a *later* connection has raised the flag again, and would then clear
         // that connection's loader instead of this one's.
         let start = ContinuousClock.now
-        for offset in settleReads {
+        for offset in backend.policy.settleReads {
             let remaining = start + offset - ContinuousClock.now
             if remaining > .zero { try? await Task.sleep(for: remaining) }
             // Re-checked after every sleep: the buds can go back in the case,
@@ -310,8 +353,8 @@ public final class DeviceController {
                   state.connection.isReady,
                   state.pendingMode == nil
             else { return }
-            // The reply reaches `state` through `apply`, like every other read.
-            _ = try? await transport.request(.getMode)
+            // The answer reaches `state` through `apply`, like every other read.
+            await backend.refreshMode()
             // The UI stops waiting after the *first* of these lands, not after
             // all of them. The later reads are silent corrections; blocking the
             // picker for 45 s to wait them out would be far worse than showing
@@ -327,15 +370,26 @@ public final class DeviceController {
     }
 
     public func refreshBattery() async {
-        _ = try? await transport.request(.getBatteryLeft)
-        _ = try? await transport.request(.getBatteryRight)
+        await backend.refreshBattery()
     }
 
     /// After wake, the link usually survives but the state may be stale.
+    ///
+    /// Deliberately `refreshMode()` + `refreshBattery()` rather than
+    /// `refresh()`, which restores this method's original behaviour exactly
+    /// (it read the mode and both batteries, never the firmware) — and, more
+    /// importantly, breaks a reconnect loop.
+    ///
+    /// `refresh()` is the *connect* hook. On a device that pushes its state
+    /// when a link comes up, prompting it means tearing the link down and
+    /// rebuilding it, which re-fires `connectionChanged(.ready)` and calls
+    /// `refreshAfterConnect` again — forever. Keeping the wake path on the
+    /// narrower hooks means the only method that may reopen a link is one
+    /// nothing in the connect path calls.
     public func refreshOnWake() async {
         guard state.connection.isReady else { return }
-        _ = try? await transport.request(.getMode)
-        await refreshBattery()
+        await backend.refreshMode()
+        await backend.refreshBattery()
     }
 
     public func connectionChanged(_ new: ConnectionState) async {
@@ -366,12 +420,19 @@ public final class DeviceController {
         // to get wrong.
         state.isResolvingMode = new.isReady
         publish()
-        guard new.isReady else { return }
+        guard state.connection.isReady else { return }
         await refreshAfterConnect()
         // Started after the refresh, and only if the link is still up: the
         // refresh takes up to ~12 s of awaits, and the buds can be back in
         // the case by the time it returns.
         guard state.connection.isReady else { return }
+        // A device that pushes its state on connect has nothing to settle, and
+        // must not be left showing the loader waiting for a re-read that will
+        // never be scheduled.
+        guard !backend.policy.settleReads.isEmpty else {
+            clearResolving()
+            return
+        }
         settleTask = Task { [weak self] in await self?.settleMode() }
     }
 }
