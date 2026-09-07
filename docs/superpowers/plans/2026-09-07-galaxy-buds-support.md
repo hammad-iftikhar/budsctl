@@ -1334,8 +1334,16 @@ struct GaiaBackendTests {
         backend.start()
         let first = backend.events()
         let second = backend.events()
-        let a = Task { for await event in first { return event }; return nil as DeviceEvent? }
-        let b = Task { for await event in second { return event }; return nil as DeviceEvent? }
+        // Explicit return type: without it the trailing `return nil` cannot be
+        // inferred against the `return event` above it.
+        let a = Task { () -> DeviceEvent? in
+            for await event in first { return event }
+            return nil
+        }
+        let b = Task { () -> DeviceEvent? in
+            for await event in second { return event }
+            return nil
+        }
         transport.emitModeChange(.anc)
         #expect(await a.value == .mode(.anc))
         #expect(await b.value == .mode(.anc))
@@ -1823,9 +1831,11 @@ In `Tests/BudsKitTests/DeviceControllerTests.swift`, change only the helper and 
 
 Update every destructuring site to the four-tuple (`let (controller, transport, _, _) = …`, and so on).
 
-Replace every `controller.settleReads = [...]` with `backend.policy.settleReads = [...]`, taking `backend` from the tuple. There are eight such lines (at roughly 331, 347, 363, 376, 392, 410, 422, and one more — find them with `grep -n settleReads`).
+Replace every `controller.settleReads = [...]` with `backend.policy.settleReads = [...]`, taking `backend` from the tuple. **There are exactly 7, at lines 331, 347, 363, 376, 392, 410 and 422** — verified with `grep -n settleReads Tests/BudsKitTests/DeviceControllerTests.swift`. Re-run that grep after your edits and expect zero `controller.settleReads` hits.
 
-`settleReads` is read in `start()` for the battery task and in `connectionChanged` for the settle task, both *after* construction, so setting the policy after `makeController` returns still takes effect for the `connectionChanged`-driven tests. For the one test that needs a battery poll, if any, set `backend.policy.batteryInterval` **before** calling `controller.start()`; check with `grep -n batteryInterval Tests/`.
+**No test sets `batteryInterval`** — verified, `grep -n batteryInterval Tests/` returns nothing. So the ordering caveat below does not bite any existing test, but keep it in mind if you add one: `backend.policy.batteryInterval` is read once inside `start()`, so it must be set *before* `controller.start()` to have any effect. `settleReads` is read in `connectionChanged`, which runs after construction, so setting it after `makeController` returns works fine.
+
+**Only `DeviceControllerTests.swift` constructs a `DeviceController`** — verified with `grep -ln "DeviceController(" Tests/BudsKitTests/*.swift`. `TransportTests`, `IntentsTests`, `StateModelTests`, `StateBridgeTests` and `GaiaFrameTests` need no changes from this task.
 
 The test at line ~252 constructs a controller inline; update it the same way:
 
