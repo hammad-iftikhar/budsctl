@@ -96,23 +96,29 @@ struct StateBridgeTests {
         #expect(bridge.takeRequest() == .setMode(.anc))
     }
 
-    @Test("the peripheral identifier persists and can be cleared")
-    func peripheralIdentifier() {
-        let bridge = StateBridge(defaults: scratchDefaults())
-        #expect(bridge.peripheralIdentifier == nil)
-        let id = UUID()
-        bridge.savePeripheralIdentifier(id)
-        #expect(bridge.peripheralIdentifier == id)
-        bridge.savePeripheralIdentifier(nil)   // the re-pair recovery path
-        #expect(bridge.peripheralIdentifier == nil)
+    @Test("a saved device ref survives a read back")
+    func deviceRefRoundTrip() {
+        let suite = "budsctl.test.\(UUID().uuidString)"
+        let bridge = StateBridge(defaults: UserDefaults(suiteName: suite)!)
+        #expect(bridge.deviceRef == nil)
+
+        let ref = DeviceRef(backend: "samsung", id: "98-80-bb-41-1a-93")
+        bridge.saveDeviceRef(ref)
+        #expect(bridge.deviceRef == ref)
+
+        bridge.saveDeviceRef(nil)
+        #expect(bridge.deviceRef == nil)
     }
 
-    @Test("a corrupt stored identifier is treated as absent, not fatal")
-    func corruptIdentifier() {
-        let defaults = scratchDefaults()
-        defaults.set("not-a-uuid", forKey: "peripheralIdentifier")
+    @Test("a v1.2 bare-UUID value reads back as a gaia device")
+    func deviceRefMigration() {
+        let suite = "budsctl.test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        // Exactly what v1.2's savePeripheralIdentifier wrote.
+        defaults.set("2B4A9F10-0000-0000-0000-000000000000", forKey: "peripheralIdentifier")
         let bridge = StateBridge(defaults: defaults)
-        #expect(bridge.peripheralIdentifier == nil)
+        #expect(bridge.deviceRef == DeviceRef(backend: "gaia",
+                                              id: "2B4A9F10-0000-0000-0000-000000000000"))
     }
 
     @Test("both request cases survive a JSON round trip")

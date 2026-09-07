@@ -168,14 +168,16 @@ public final class GaiaClient: NSObject, GaiaTransport {
     }
 
     private func attemptConnect() {
-        guard let identifier = bridge.peripheralIdentifier else {
+        guard let ref = bridge.deviceRef, ref.backend == "gaia",
+              let identifier = UUID(uuidString: ref.id)
+        else {
             report(.notConfigured)
             return
         }
         let known = central.retrievePeripherals(withIdentifiers: [identifier])
         guard let found = known.first else {
             // The identifier is dead — the user re-paired. Do not spin on it.
-            bridge.savePeripheralIdentifier(nil)
+            bridge.saveDeviceRef(nil)
             report(.notConfigured)
             return
         }
@@ -269,13 +271,13 @@ public final class GaiaClient: NSObject, GaiaTransport {
 
     public func select(_ device: DiscoveredDevice) {
         stopScan()
-        bridge.savePeripheralIdentifier(device.id)
+        bridge.saveDeviceRef(DeviceRef(backend: "gaia", id: device.id.uuidString))
         attemptConnect()
     }
 
     public func forgetDevice() {
         releasePeripheral()
-        bridge.savePeripheralIdentifier(nil)
+        bridge.saveDeviceRef(nil)
         report(.notConfigured)
     }
 
