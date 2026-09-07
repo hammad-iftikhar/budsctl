@@ -13,7 +13,7 @@ import BudsKit
 @MainActor
 final class Runner {
     let bridge = StateBridge(defaults: .standard)
-    lazy var client = GaiaClient(bridge: bridge)
+    lazy var client = GaiaClient()
 
     // withTimeout races the operation against a sleep inside a task group, and
     // a task group drains all its children even after cancelAll() — cancelling
@@ -34,6 +34,10 @@ final class Runner {
         }
         defer { continuation.finish() }
         client.start()
+        guard let ref = bridge.deviceRef, ref.backend == "gaia" else {
+            throw CLIError.message("No device saved. Run `budsctl-cli discover` first.")
+        }
+        client.adopt(ref)
 
         let outcome = await withTimeout(timeout) { () -> Result<Void, CLIError> in
             for await state in states {
@@ -120,7 +124,8 @@ struct CLI {
         guard let line = readLine(), let index = Int(line), seen.indices.contains(index) else {
             throw CLIError.message("Not a valid choice.")
         }
-        runner.client.select(seen[index])
+        runner.bridge.saveDeviceRef(seen[index].id)
+        runner.client.adopt(seen[index].id)
         print("saved \(seen[index].name) as \(seen[index].id)")
     }
 

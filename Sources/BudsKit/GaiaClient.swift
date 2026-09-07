@@ -2,17 +2,23 @@ import Foundation
 import CoreBluetooth
 
 public struct DiscoveredDevice: Identifiable, Sendable, Equatable {
-    public let id: UUID
+    public let id: DeviceRef
     public let name: String
 
-    /// Whether to show this in the default, filtered device list.
-    public var isLikelyMatch: Bool {
-        name.uppercased().contains("SOUNDPEATS")
-    }
+    /// Whether this looks like a device the finding backend can actually
+    /// drive. Filters the *scan* list only — never the connected list, where
+    /// the lookup has already narrowed things down and filtering further would
+    /// only hide the device you are looking for.
+    ///
+    /// Stored rather than computed: with two backends merging into one list, a
+    /// single global name test cannot answer it, and the backend that found the
+    /// device already knows.
+    public let isLikelyMatch: Bool
 
-    public init(id: UUID, name: String) {
+    public init(id: DeviceRef, name: String, isLikelyMatch: Bool) {
         self.id = id
         self.name = name
+        self.isLikelyMatch = isLikelyMatch
     }
 }
 
@@ -52,11 +58,12 @@ public final class FrameHub: @unchecked Sendable {
 @MainActor
 public final class GaiaClient: NSObject, GaiaTransport {
 
-    private let bridge: StateBridge
     private let hub = FrameHub()
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
+    /// The device `AppModel` told us to keep connected, or nil.
+    private var adopted: DeviceRef?
     private var commandCharacteristic: CBCharacteristic?
     private var responseCharacteristic: CBCharacteristic?
 
@@ -86,7 +93,7 @@ public final class GaiaClient: NSObject, GaiaTransport {
     /// another write.
     private static let writeTimeout: Duration = .seconds(5)
 
-    private var discovered: [UUID: DiscoveredDevice] = [:]
+    private var discovered: [DeviceRef: DiscoveredDevice] = [:]
     /// An explicit scan request that arrived before the radio was ready.
     private var wantsScan = false
 
@@ -94,17 +101,33 @@ public final class GaiaClient: NSObject, GaiaTransport {
     public var onDiscoveryUpdate: (@MainActor ([DiscoveredDevice]) -> Void)?
     public private(set) var deviceName: String?
 
-    public init(bridge: StateBridge) {
-        self.bridge = bridge
+    public override init() {
         super.init()
         // Main queue so every delegate callback is already on the main actor.
         self.central = CBCentralManager(delegate: self, queue: .main)
     }
 
-    /// Kick things off. Safe to call before Bluetooth is powered on — the
-    /// state callback will drive the rest.
+    /// Bring the radio up. Safe to call before Bluetooth is powered on — the
+    /// state callback drives the rest.
+    ///
+    /// Does **not** connect. With more than one backend in the app, every
+    /// backend is started so both brands appear in Settings, but only the one
+    /// owning the user's saved device is adopted. `AppModel` decides that; this
+    /// type no longer reads the bridge to decide it for itself.
     public func start() {
         centralManagerDidUpdateState(central)
+    }
+
+    /// Adopt a device and keep it connected. Idempotent for the same ref.
+    public func adopt(_ ref: DeviceRef) {
+        adopted = ref
+        attemptConnect()
+    }
+
+    /// Drop the link and stop reporting.
+    public func release() {
+        adopted = nil
+        releasePeripheral()
     }
 
     // MARK: - GaiaTransport
@@ -168,16 +191,16 @@ public final class GaiaClient: NSObject, GaiaTransport {
     }
 
     private func attemptConnect() {
-        guard let ref = bridge.deviceRef, ref.backend == "gaia",
-              let identifier = UUID(uuidString: ref.id)
-        else {
+        guard let adopted, let identifier = UUID(uuidString: adopted.id) else {
             report(.notConfigured)
             return
         }
         let known = central.retrievePeripherals(withIdentifiers: [identifier])
         guard let found = known.first else {
             // The identifier is dead — the user re-paired. Do not spin on it.
-            bridge.saveDeviceRef(nil)
+            // Reported as unconfigured; clearing the *saved* device is
+            // AppModel's job now, since only it owns persistence.
+            self.adopted = nil
             report(.notConfigured)
             return
         }
@@ -199,6 +222,18 @@ public final class GaiaClient: NSObject, GaiaTransport {
 
     // MARK: - Discovery
 
+    /// The backend id these devices belong to. Matches `GaiaBackend.id`, which
+    /// is declared in the file that adapts this client to `EarbudsBackend`.
+    private static let backendID = "gaia"
+
+    private func device(_ peripheral: CBPeripheral, name: String) -> DiscoveredDevice {
+        DiscoveredDevice(
+            id: DeviceRef(backend: Self.backendID, id: peripheral.identifier.uuidString),
+            name: name,
+            isLikelyMatch: name.uppercased().contains("SOUNDPEATS")
+        )
+    }
+
     /// LE peripherals already connected to this Mac. No scan, so this returns
     /// instantly and works with the buds in your ears — which is what makes it
     /// usable as the default list in settings.
@@ -215,13 +250,11 @@ public final class GaiaClient: NSObject, GaiaTransport {
             CBUUID(string: GaiaUUIDs.service),
             CBUUID(string: GaiaUUIDs.batteryService),
         ]
-        var found: [UUID: DiscoveredDevice] = [:]
+        var found: [DeviceRef: DiscoveredDevice] = [:]
         for peripheral in central.retrieveConnectedPeripherals(withServices: services) {
             guard let name = peripheral.name, !name.isEmpty else { continue }
-            found[peripheral.identifier] = DiscoveredDevice(
-                id: peripheral.identifier,
-                name: name
-            )
+            let entry = device(peripheral, name: name)
+            found[entry.id] = entry
         }
         return found.values.sorted { $0.name < $1.name }
     }
@@ -263,22 +296,10 @@ public final class GaiaClient: NSObject, GaiaTransport {
 
     private func record(_ peripheral: CBPeripheral, name: String?) {
         guard let name, !name.isEmpty else { return }
-        let device = DiscoveredDevice(id: peripheral.identifier, name: name)
-        guard discovered[device.id] != device else { return }
-        discovered[device.id] = device
+        let entry = device(peripheral, name: name)
+        guard discovered[entry.id] != entry else { return }
+        discovered[entry.id] = entry
         onDiscoveryUpdate?(discovered.values.sorted { $0.name < $1.name })
-    }
-
-    public func select(_ device: DiscoveredDevice) {
-        stopScan()
-        bridge.saveDeviceRef(DeviceRef(backend: "gaia", id: device.id.uuidString))
-        attemptConnect()
-    }
-
-    public func forgetDevice() {
-        releasePeripheral()
-        bridge.saveDeviceRef(nil)
-        report(.notConfigured)
     }
 
     /// Lets go of the adopted peripheral completely: closes the link, drops the
@@ -325,7 +346,7 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
             }
             return
         }
-        attemptConnect()
+        if adopted != nil { attemptConnect() }
         // A scan asked for before the radio was ready starts now, not never.
         if wantsScan { beginScan() }
     }
@@ -341,8 +362,8 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        // A forgotten peripheral can still complete a connect that was in
-        // flight before `forgetDevice()` ran. Ignore it — `attemptConnect` is
+        // A released peripheral can still complete a connect that was in
+        // flight before `release()` ran. Ignore it — `attemptConnect` is
         // the only place that adopts a peripheral.
         guard peripheral === self.peripheral else { return }
         deviceName = peripheral.name
