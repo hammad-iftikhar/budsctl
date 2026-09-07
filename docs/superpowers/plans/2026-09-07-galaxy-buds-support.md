@@ -1866,6 +1866,16 @@ In `Tests/BudsKitTests/DeviceControllerTests.swift`, change only the helper and 
     ) -> (DeviceController, FakeTransport, GaiaBackend, StateBridge) {
         let transport = FakeTransport(mode: mode, applyDelay: applyDelay)
         let backend = GaiaBackend(transport: transport)
+        // Required, and easy to miss: `DeviceController.start()` subscribes to
+        // `backend.events()`, but the pump that feeds that hub from
+        // `transport.frames()` is started only by `GaiaBackend.start()`.
+        // Without this every event-driven test in the suite fails.
+        //
+        // Deliberately not called from `DeviceController.start()`:
+        // `EarbudsBackend.start()` is the app-level radio-and-discovery hook,
+        // and a controller that brings radios up would contradict the design
+        // (`AppModel` starts every backend; only one is adopted).
+        backend.start()
         // Off by default so no test waits out the real 2 s first re-read; the
         // tests that exercise settling set their own schedule.
         backend.policy = BackendPolicy()
@@ -2848,6 +2858,7 @@ git commit -m "feat: add SamsungBackend over IOBluetooth RFCOMM"
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–8.
+- **Contract Task 6 established:** `DeviceController` starts nothing on its backend. `AppModel` must call `backend.start()` on every backend before handing one to `DeviceController`, and `controller.use(_:)` assumes the backend it receives is already started (it calls its own `start()`, not the backend's). The `init` loop below does this for all backends, which is why `use(_:)` is safe.
 - Produces: `Backends.all() -> [any EarbudsBackend]`. `AppModel.devices: [DiscoveredDevice]`, `AppModel.select(_ device: DiscoveredDevice)`, `AppModel.forget()`, `AppModel.refreshDevices()`, `AppModel.startScan()`, `AppModel.stopScan()`, `AppModel.selectedRef: DeviceRef?`.
 
 - [ ] **Step 1: Add the registry**
@@ -2989,16 +3000,22 @@ Replace the device-management methods at the end of `AppModel`:
         else { return }
 
         // Release whatever held a link before, so a de-selected device's
-        // notifications can no longer reach the controller.
+        // notifications can no longer reach the controller. `DeviceController.use`
+        // deliberately does *not* do this — the caller owns it, because only the
+        // caller knows which other backends exist.
         for backend in backends where type(of: backend).id != device.id.backend {
             backend.release()
         }
 
+        // Computed BEFORE the save, and the order is load-bearing:
+        // `activeBackend` derives from `bridge.deviceRef`, so saving first would
+        // make this comparison always false and the controller would never be
+        // switched to the new family.
         let switchingFamily = type(of: activeBackend).id != device.id.backend
         bridge.saveDeviceRef(device.id)
-        // Persisted first: `use` and `activeBackend` both read the saved ref to
-        // decide who is live.
         if switchingFamily { controller.use(target) }
+        // `adopt` reports `.connecting`, which is what repaints the UI after a
+        // switch — `release()` above reports nothing, by design.
         target.adopt(device.id)
     }
 
