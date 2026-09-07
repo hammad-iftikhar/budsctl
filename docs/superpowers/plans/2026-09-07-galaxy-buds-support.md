@@ -908,7 +908,14 @@ public protocol EarbudsBackend: AnyObject {
     /// behind that can still mutate state — a de-selected device's
     /// notifications reaching `DeviceController` is a bug with history on the
     /// GAIA side.
-    func release()
+    ///
+    /// **Not named `release()`**, and that is not a style preference:
+    /// `NSObject.release()` is a witness candidate in protocol conformance
+    /// lookup even though it is unavailable under ARC, so any `NSObject`-based
+    /// backend — `SamsungBackend` is one — fails to conform with "multiple
+    /// matching functions named 'release()'". The name is also ambiguous:
+    /// release memory, or release the device?
+    func disconnect()
 
     /// A **fresh** stream per caller.
     ///
@@ -991,7 +998,7 @@ git commit -m "feat: add the EarbudsBackend contract, DeviceEvent and BackendPol
 
 **Interfaces:**
 - Consumes: `DeviceRef` (Task 1).
-- Produces: `DiscoveredDevice(id: DeviceRef, name: String, isLikelyMatch: Bool)`. `GaiaClient.start()` (radio only), `GaiaClient.adopt(_ ref: DeviceRef)`, `GaiaClient.release()`. `GaiaClient.select(_:)` and `forgetDevice()` are **removed** — adoption and persistence move to `AppModel` in Task 9.
+- Produces: `DiscoveredDevice(id: DeviceRef, name: String, isLikelyMatch: Bool)`. `GaiaClient.start()` (radio only), `GaiaClient.adopt(_ ref: DeviceRef)`, `GaiaClient.disconnect()`. `GaiaClient.select(_:)` and `forgetDevice()` are **removed** — adoption and persistence move to `AppModel` in Task 9.
 
 - [ ] **Step 1: Change `DiscoveredDevice`**
 
@@ -1043,7 +1050,7 @@ In the same file, replace `start()` and `attemptConnect()`:
     }
 
     /// Drop the link and stop reporting.
-    public func release() {
+    public func disconnect() {
         adopted = nil
         releasePeripheral()
     }
@@ -1363,7 +1370,7 @@ struct GaiaBackendTests {
         let transport = FakeTransport()
         let backend = GaiaBackend(transport: transport)
         backend.start()
-        backend.release()
+        backend.disconnect()
         let stream = backend.events()
         transport.emitModeChange(.anc)
         let raced = await withTimeout(.milliseconds(200)) { () -> DeviceEvent? in
@@ -1449,10 +1456,10 @@ public final class GaiaBackend: EarbudsBackend {
         }
     }
 
-    public func release() {
+    public func disconnect() {
         pump?.cancel()
         pump = nil
-        client?.release()
+        client?.disconnect()
     }
 
     public func adopt(_ ref: DeviceRef) {
@@ -2251,7 +2258,7 @@ The radio. Not unit-testable without Galaxy Buds, which is exactly why Tasks 2 a
 - `IOBluetoothSDPUUID(bytes:length:)` — **non-optional**, so no `guard let`
 - `IOBluetoothSDPServiceRecord.getRFCOMMChannelID(_:)`
 - `IOBluetoothDevice.register(forConnectNotifications:selector:)` with an `@objc` method taking `(IOBluetoothUserNotification, IOBluetoothDevice)`
-- `IOBluetoothRFCOMMChannel.isOpen()`, `.getMTU()`, `.setDelegate(_:)`, `.close()`, `.writeAsync(_:length:refcon:)`
+- `IOBluetoothRFCOMMChannel.isOpen()`, `.getMTU()`, `.setDelegate(_:)`, `.close()`, `.writeSync(_:length:)` (and `.writeAsync(_:length:refcon:)`, which compiles but is **not** used — see `send(_:_:)` for why)
 - **`extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate` compiles.** The protocol is exposed to Swift and the `@MainActor` conformance is accepted, so the fallback to an informal selector-only delegate described in Step 3 should not be needed.
 - `@objc(sdpQueryComplete:status:)` on an extension method compiles.
 
@@ -2314,20 +2321,6 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     private var openAttempt = 0
     private var retryTask: Task<Void, Never>?
 
-    /// One writer awaiting its `rfcommChannelWriteComplete`.
-    ///
-    /// Keyed by `refcon` rather than by FIFO position, for the same reason
-    /// `GaiaClient.PendingWrite` carries an id: a write that times out can then
-    /// remove *itself* without desynchronising everyone behind it.
-    private var pendingWrites: [UInt64: CheckedContinuation<Void, Error>] = [:]
-    private var lastWriteID: UInt64 = 0
-
-    /// Bounds every write in time. IOBluetooth is supposed to always call
-    /// `rfcommChannelWriteComplete`, but a stale continuation would take the
-    /// next write's completion and deadlock every write from then on, and a
-    /// `CheckedContinuation` held in a dictionary produces no runtime warning.
-    private static let writeTimeout: Duration = .seconds(5)
-
     /// Retry offsets for an RFCOMM open that fails while the baseband link is
     /// up — usually buds still settling after leaving the case. Bounded, so a
     /// device that genuinely refuses SPP does not spin forever; the next
@@ -2365,13 +2358,13 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
 
     public func adopt(_ ref: DeviceRef) {
         guard adopted != ref else { return }
-        release()
+        disconnect()
         adopted = ref
         armConnectNotification()
         Task { await openLink() }
     }
 
-    public func release() {
+    public func disconnect() {
         retryTask?.cancel()
         retryTask = nil
         adopted = nil
@@ -2386,10 +2379,6 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         channel.close()
         self.channel = nil
         reassembler = SppReassembler()
-        // Not optional. A leaked continuation would take the next write's
-        // completion and deadlock every write after it — the same hazard
-        // `GaiaClient.releasePeripheral` documents.
-        failPendingWrites(SamsungError.notConnected)
     }
 
     private func report(_ state: ConnectionState) {
@@ -2602,7 +2591,7 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     // MARK: - Actions
 
     public func setMode(_ mode: ANCMode) async throws {
-        try await send(.noiseControls, [mode.rawValue])
+        try send(.noiseControls, [mode.rawValue])
     }
 
     /// Deliberately does nothing.
@@ -2644,78 +2633,45 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     /// `STATUS_UPDATED` on every battery change.
     public func refreshBattery() async {}
 
-    private func send(_ id: SppMessageID, _ payload: [UInt8] = []) async throws {
-        let data = SppFrame.encode(id, payload)
-        try await withCheckedThrowingContinuation { continuation in
-            submitWrite(data, continuation)
-        }
-    }
-
-    /// Recording the continuation and calling `writeAsync` happen in one
-    /// main-actor step, so a completion cannot arrive before its `refcon` is in
-    /// the table.
-    private func submitWrite(
-        _ data: Data,
-        _ continuation: CheckedContinuation<Void, Error>
-    ) {
-        guard let channel, channel.isOpen() else {
-            continuation.resume(throwing: SamsungError.notConnected)
-            return
-        }
-        lastWriteID += 1
-        let id = lastWriteID
-        pendingWrites[id] = continuation
-
-        // Chunked to the channel MTU. Every message this app sends is under a
-        // dozen bytes, so the loop never runs twice — kept because dropping it
-        // would silently truncate if a longer message is ever added.
-        var bytes = [UInt8](data)
+    /// Chunked to the channel MTU. Every message this app sends is under a
+    /// dozen bytes, so the loop never runs twice — kept because dropping it
+    /// would silently truncate if a longer message is ever added.
+    ///
+    /// `writeSync`, deliberately, not `writeAsync`. The async variant takes a
+    /// pointer it may read after returning, and a Swift buffer pointer is only
+    /// guaranteed valid inside its closure — the SDK header promises merely
+    /// that the data "was buffered successfully", and states elsewhere that
+    /// IOBluetooth does *not* buffer ("we stop the transmitting actor").
+    /// `writeSync` is documented to block until the bytes reach the hardware,
+    /// so there is no lifetime question at all. GalaxyBudsClient's own macOS
+    /// backend uses it too.
+    ///
+    /// A synchronous write also reports its own result, which is why this
+    /// backend has no pending-write FIFO, no write timeout, no `refcon`
+    /// plumbing and no write-completion delegate — the SDP query holds the only
+    /// continuation in the file.
+    ///
+    /// ponytail: blocks the main actor for the duration of a write. Bounded and
+    /// tiny for a dozen bytes on an open channel; if flow control ever stalls
+    /// one (`isTransmissionPaused` exists to detect that), move `send` off the
+    /// main actor rather than going back to `writeAsync`.
+    private func send(_ id: SppMessageID, _ payload: [UInt8] = []) throws {
+        guard let channel, channel.isOpen() else { throw SamsungError.notConnected }
+        var bytes = [UInt8](SppFrame.encode(id, payload))
         let mtu = Int(channel.getMTU())
-        var status = kIOReturnSuccess
-        while !bytes.isEmpty, status == kIOReturnSuccess {
-            let count = min(bytes.count, mtu)
-            var chunk = Array(bytes.prefix(count))
-            status = chunk.withUnsafeMutableBufferPointer { buffer in
-                channel.writeAsync(
-                    buffer.baseAddress,
-                    length: UInt16(count),
-                    refcon: UnsafeMutableRawPointer(bitPattern: UInt(id))
-                )
-            }
-            bytes.removeFirst(count)
+        // A zero MTU would make `count` zero and spin this loop forever on the
+        // main actor — a hung menu bar with no crash to report. Unreachable
+        // behind `isOpen()`, guarded anyway because the cost of being wrong is
+        // a beachball and the cost of the guard is one line.
+        guard mtu > 0 else { throw SamsungError.writeFailed }
+        var offset = 0
+        while offset < bytes.count {
+            let count = min(mtu, bytes.count - offset)
+            let status: IOReturn = bytes[offset..<(offset + count)]
+                .withUnsafeMutableBufferPointer { channel.writeSync($0.baseAddress, length: UInt16(count)) }
+            guard status == kIOReturnSuccess else { throw SamsungError.writeFailed }
+            offset += count
         }
-
-        guard status == kIOReturnSuccess else {
-            completeWrite(id, error: SamsungError.writeFailed)
-            return
-        }
-
-        // Not a retry and not a poll: it only ever resumes a continuation that
-        // is still waiting, so nothing is re-sent to the device.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: Self.writeTimeout)
-            self?.completeWrite(id, error: SamsungError.writeFailed)
-        }
-    }
-
-    /// Resumes `id` only if it is still pending. Whoever gets here first —
-    /// completion, timeout, or teardown — removes the entry before resuming,
-    /// which is what makes a double resume impossible.
-    private func completeWrite(_ id: UInt64, error: Error?) {
-        guard let continuation = pendingWrites.removeValue(forKey: id) else { return }
-        if let error {
-            continuation.resume(throwing: error)
-        } else {
-            continuation.resume()
-        }
-    }
-
-    /// Drains everything, resuming each entry exactly once. Cleared before any
-    /// resume so a re-entrant call cannot see the same entry twice.
-    private func failPendingWrites(_ error: Error) {
-        let waiting = pendingWrites
-        pendingWrites.removeAll()
-        for continuation in waiting.values { continuation.resume(throwing: error) }
     }
 }
 
@@ -2741,7 +2697,7 @@ extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate {
         // Announce ourselves, the way the reference implementation does on
         // connect. The buds push EXTENDED_STATUS_UPDATED without being asked,
         // so nothing here requests state.
-        Task { try? await send(.managerInfo, [0x01, 0x02, 0x22]) }
+        try? send(.managerInfo, [0x01, 0x02, 0x22])
     }
 
     public func rfcommChannelData(
@@ -2756,16 +2712,6 @@ extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate {
             frameHub.yield(frame)
             for event in frame.events { hub.yield(event) }
         }
-    }
-
-    public func rfcommChannelWriteComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        refcon: UnsafeMutableRawPointer!,
-        status error: IOReturn
-    ) {
-        guard rfcommChannel === channel else { return }
-        let id = UInt64(UInt(bitPattern: refcon))
-        completeWrite(id, error: error == kIOReturnSuccess ? nil : SamsungError.writeFailed)
     }
 
     public func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
@@ -2819,7 +2765,7 @@ Expected: no errors, no warnings.
 IOBluetooth is an old ObjC framework, so expect friction here. Fix diagnostics without weakening isolation:
 
 - Delegate methods must be reachable from ObjC. If Swift 6 rejects `@MainActor` on a delegate conformance, mark the individual methods `@objc` and keep the `extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate` form used above, which is the same pattern `GaiaClient` uses for `CBPeripheralDelegate`.
-- If `IOBluetoothRFCOMMChannelDelegate` is not exposed as a Swift protocol in this SDK, drop the conformance clause and keep the methods as `@objc` members with their exact selectors (`rfcommChannelData:data:length:`, `rfcommChannelOpenComplete:status:`, `rfcommChannelWriteComplete:refcon:status:`, `rfcommChannelClosed:`) — IOBluetooth dispatches by selector, so an informal delegate works. Verify with `nm`-free reasoning: the reference implementation's `Bluetooth.mm` uses exactly these selectors.
+- If `IOBluetoothRFCOMMChannelDelegate` is not exposed as a Swift protocol in this SDK, drop the conformance clause and keep the methods as `@objc` members with their exact selectors (`rfcommChannelData:data:length:`, `rfcommChannelOpenComplete:status:`, `rfcommChannelClosed:`) — IOBluetooth dispatches by selector, so an informal delegate works. Verify with `nm`-free reasoning: the reference implementation's `Bluetooth.mm` uses exactly these selectors.
 - `IOBluetoothDevice.register(forConnectNotifications:selector:)` may need the target passed as `self` with `#selector` on an `@objc` method whose signature is `(IOBluetoothUserNotification, IOBluetoothDevice)`. That is what `deviceConnected` above is.
 
 Do **not** silence a diagnostic with `nonisolated(unsafe)` or `@unchecked Sendable` on `SamsungBackend` itself. If isolation genuinely cannot be expressed, stop and report it.
@@ -3004,7 +2950,7 @@ Replace the device-management methods at the end of `AppModel`:
         // deliberately does *not* do this — the caller owns it, because only the
         // caller knows which other backends exist.
         for backend in backends where type(of: backend).id != device.id.backend {
-            backend.release()
+            backend.disconnect()
         }
 
         // Computed BEFORE the save, and the order is load-bearing:
@@ -3015,12 +2961,12 @@ Replace the device-management methods at the end of `AppModel`:
         bridge.saveDeviceRef(device.id)
         if switchingFamily { controller.use(target) }
         // `adopt` reports `.connecting`, which is what repaints the UI after a
-        // switch — `release()` above reports nothing, by design.
+        // switch — `disconnect()` above reports nothing, by design.
         target.adopt(device.id)
     }
 
     func forget() {
-        for backend in backends { backend.release() }
+        for backend in backends { backend.disconnect() }
         bridge.saveDeviceRef(nil)
         Task { await controller.connectionChanged(.notConfigured) }
     }
