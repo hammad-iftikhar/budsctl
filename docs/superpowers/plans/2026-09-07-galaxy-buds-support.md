@@ -16,7 +16,7 @@
 - macOS deployment target `26.0`.
 - **No new package dependencies.** IOBluetooth ships in the macOS SDK.
 - Tests use swift-testing, not XCTest. Run with `swift test`.
-- **Baseline is 78 tests in 6 suites, all passing.** Every task must end with the full suite green. Task 6 is the only task that may edit existing test bodies, and it must not delete or weaken an assertion.
+- **Baseline is 78 tests in 6 suites at branch start.** Running totals as tasks land: T1 → 84/7, T2 → 105/9, T5 → 116/10, T6 → 118/10, T7 → 132/12. Later tasks add no tests. Each task's brief states its own expected total; trust the count of `@Test` functions in the brief's code over any prose number. Every task must end with the full suite green. Task 6 is the only task that may edit existing test bodies, and it must not delete or weaken an assertion.
 - **`ModeSnapshot`, `BridgeRequest`, the App Group keys, the Darwin notification name, and all four App Intents are frozen.** They are cross-process contracts; an installed appex older than the agent must keep working.
 - `ANCMode` keeps exactly three cases (`normal = 0`, `anc = 1`, `passthrough = 2`). Adaptive mode (`3`) is out of scope and must be dropped on receipt, never displayed.
 - Case battery is out of scope. Read and discarded.
@@ -789,7 +789,7 @@ public struct SppReassembler: Sendable {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `swift test --filter Spp 2>&1 | tail -10`
-Expected: PASS, 24 tests across the two new suites.
+Expected: PASS, **21 tests** across the two new suites (11 codec + 10 reassembler). Running total: **105 tests / 9 suites**.
 
 Then the whole suite: `swift test 2>&1 | tail -5` — expect all green.
 
@@ -1517,7 +1517,7 @@ public final class GaiaBackend: EarbudsBackend {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `swift test --filter GaiaBackend 2>&1 | tail -10`
-Expected: PASS, 11 tests.
+Expected: PASS, **11 tests**. Running total after this task: **116 tests / 10 suites**.
 
 Run: `swift test 2>&1 | tail -5` — all green.
 
@@ -1883,7 +1883,7 @@ Add two tests for the new behaviour at the end of the suite:
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `swift test 2>&1 | tail -8`
-Expected: PASS. Two more tests than after Task 5.
+Expected: PASS, **118 tests / 10 suites** — two more than after Task 5, in the existing `DeviceController set-mode flow` suite.
 
 If a pre-existing assertion fails, **stop and report which one** rather than editing it — a failure here means the refactor changed behaviour, which is the one thing this task must not do.
 
@@ -2158,7 +2158,7 @@ private enum ExtendedStatusNotes {}
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `swift test --filter SppEvents 2>&1 | tail -10`
-Expected: PASS, 15 tests.
+Expected: PASS, **14 tests**. Running total after this task: **132 tests / 12 suites**.
 
 Run: `swift test 2>&1 | tail -5` — all green.
 
@@ -2273,9 +2273,14 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     /// connect notification is the real recovery path.
     private static let openRetries: [Duration] = [.seconds(1), .seconds(3), .seconds(7)]
 
-    /// Tried in order. Buds2 and later, Buds FE included, publish the first;
-    /// Buds Pro, Buds Live and Buds+ publish the second.
-    private static let serviceUUIDs: [[UInt8]] = [
+    /// Tried in order at connect time. Buds2 and later, Buds FE included,
+    /// publish the first; Buds Pro, Buds Live and Buds+ publish the second.
+    ///
+    /// Index 0 doubles as the discovery test in `connectedDevices()` — it is
+    /// Samsung-specific. Index 1 must never be used for discovery: it is the
+    /// generic serial-port UUID that many devices publish, the Air4 Pro
+    /// included.
+    static let serviceUUIDs: [[UInt8]] = [
         // 2e73a4ad-332d-41fc-90e2-16bef06523f2
         [0x2e, 0x73, 0xa4, 0xad, 0x33, 0x2d, 0x41, 0xfc,
          0x90, 0xe2, 0x16, 0xbe, 0xf0, 0x65, 0x23, 0xf2],
@@ -2332,19 +2337,51 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
 
     // MARK: - Discovery
 
-    /// Paired classic devices, with no inquiry.
+    /// Paired classic devices that plausibly are Galaxy Buds, with no inquiry.
     ///
     /// Returns instantly and works with the buds in your ears, which is what
     /// makes it usable as the default list in Settings.
+    ///
+    /// **The filter is not optional.** `pairedDevices()` is not service-filtered
+    /// the way CoreBluetooth's `retrieveConnectedPeripherals(withServices:)` is —
+    /// it returns *everything* ever paired with this Mac. Measured on the
+    /// development machine it returned nine devices: a soundbar, a PS5
+    /// controller, two keyboards, a mouse, a phone and another Mac. Listing
+    /// those under a "Samsung" header would be nonsense.
+    ///
+    /// Two tests, OR'd, because each covers the other's blind spot:
+    ///
+    /// - **Publishes `SppNew`.** Samsung-specific, so no false positives. But a
+    ///   freshly-paired device may have no cached SDP records until something
+    ///   runs a query against it, and this method deliberately does not.
+    /// - **Name contains `BUDS`.** Samsung names the entire lineup "Buds …"
+    ///   ("Buds FE", "Buds2 Pro", "Galaxy Buds+ (1234)"), so this catches the
+    ///   models that publish only the generic `SppStandard` — Buds Pro, Buds
+    ///   Live, Buds+. It misses a renamed device, which is what the UUID test
+    ///   is for.
+    ///
+    /// `SppStandard` is deliberately **not** a discovery test: it is the generic
+    /// serial-port UUID, and the SoundPEATS Air4 Pro publishes it (verified —
+    /// on RFCOMM channel 12). Filtering on it would offer the user their
+    /// SoundPEATS buds under the Samsung backend, where every frame this
+    /// backend sent would go unanswered. It stays a *connect-time* fallback in
+    /// `serviceRecord(on:)`, reached only after the user explicitly picked the
+    /// device.
     public func connectedDevices() -> [DiscoveredDevice] {
         let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
+        let samsungSpp = IOBluetoothSDPUUID(bytes: Self.serviceUUIDs[0], length: 16)
         return paired.compactMap { device -> DiscoveredDevice? in
             guard let address = device.addressString, !address.isEmpty else { return nil }
             let name = device.name ?? address
+            let named = name.uppercased().contains("BUDS")
+            let publishes = device.getServiceRecord(for: samsungSpp) != nil
+            guard named || publishes else { return nil }
             return DiscoveredDevice(
                 id: DeviceRef(backend: Self.id, id: address),
                 name: name,
-                isLikelyMatch: name.uppercased().contains("BUDS")
+                // Named *and* publishing is as sure as this gets without
+                // connecting; either alone still belongs in the list.
+                isLikelyMatch: named || publishes
             )
         }
         .sorted { $0.name < $1.name }
