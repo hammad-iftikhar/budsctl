@@ -55,3 +55,139 @@ public struct DeviceRef: Hashable, Codable, Sendable, CustomStringConvertible {
     /// and does not change with the code.
     static let legacyBackendID = "gaia"
 }
+
+/// One thing a device told us.
+///
+/// Deliberately at the altitude of what the app needs, not of the wire. GAIA
+/// has per-side battery *getters*; Samsung *pushes* one combined status
+/// message. A shared command vocabulary would have to invent commands one side
+/// cannot honour, so the shared vocabulary is the answers instead.
+///
+/// Left and right are separate cases rather than one `battery(left:right:)`
+/// so nil unambiguously means "unknown", never "no news about this side".
+public enum DeviceEvent: Sendable, Equatable {
+    case mode(ANCMode)
+    case batteryLeft(Int?)
+    case batteryRight(Int?)
+    case firmware(String)
+}
+
+/// Device quirks `DeviceController` cannot discover for itself.
+///
+/// Not speculative configuration: both fields differ between the two shipping
+/// devices. The Air4 Pro serves unreliable reads for ~45 s after connect and
+/// never announces its battery, so it needs both. Galaxy Buds push their full
+/// state on connect and their battery on change, so it needs neither.
+public struct BackendPolicy: Sendable {
+
+    /// Offsets from the moment the connection landed at which to re-read the
+    /// mode. Empty means the device pushes its state and there is nothing to
+    /// settle — which is what switches off `DeviceController.settleMode`
+    /// entirely, loader included.
+    public var settleReads: [Duration]
+
+    /// How often to poll the battery while connected, or nil when the device
+    /// pushes battery updates itself.
+    public var batteryInterval: Duration?
+
+    public init(settleReads: [Duration] = [], batteryInterval: Duration? = nil) {
+        self.settleReads = settleReads
+        self.batteryInterval = batteryInterval
+    }
+}
+
+/// One family of earbuds: its radio, its wire format, and its reconnect
+/// strategy. `DeviceController` talks to nothing else.
+///
+/// Adding a device family means one conformance and one line in
+/// `Backends.all`. If a new family needs `DeviceController`, `DeviceState`,
+/// `ModeSnapshot` or the intents changed, this seam is in the wrong place and
+/// should be moved rather than worked around.
+@MainActor
+public protocol EarbudsBackend: AnyObject {
+
+    /// Stable key, stored inside every `DeviceRef`. **Never change one** — it
+    /// is how a saved device finds its way back to this backend after a
+    /// restart.
+    static var id: String { get }
+
+    /// Vendor name, for the Settings section header.
+    static var displayName: String { get }
+
+    var onConnectionChange: (@MainActor (ConnectionState) -> Void)? { get set }
+    var onDiscoveryUpdate: (@MainActor ([DiscoveredDevice]) -> Void)? { get set }
+
+    /// Bring the radio up and make discovery work. Must **not** connect: every
+    /// backend is started so both brands show up in Settings, while only the
+    /// one holding the user's saved device is adopted.
+    func start()
+
+    /// Devices already reachable, without scanning. Cheap enough to call every
+    /// time Settings opens.
+    func connectedDevices() -> [DiscoveredDevice]
+
+    func startScan()
+    func stopScan()
+
+    /// Take ownership of this device and keep it connected across
+    /// case-in/case-out cycles.
+    func adopt(_ ref: DeviceRef)
+
+    /// Drop the link and stop reporting connection state. Must leave nothing
+    /// behind that can still mutate state — a de-selected device's
+    /// notifications reaching `DeviceController` is a bug with history on the
+    /// GAIA side.
+    func release()
+
+    /// A **fresh** stream per caller.
+    ///
+    /// `DeviceController` keeps one long-lived stream while `performSet` opens
+    /// short-lived ones; a single shared stream would let one consumer steal
+    /// another's event. Same contract, and the same reason, as
+    /// `GaiaTransport.frames()`.
+    func events() -> AsyncStream<DeviceEvent>
+
+    func setMode(_ mode: ANCMode) async throws
+
+    /// Read everything the device can tell us. Called once per connection and
+    /// again on wake. A device that pushes its state implements this as
+    /// whatever re-triggers that push.
+    func refresh() async
+
+    /// Re-read just the mode. Called only by the settle loop, so only reachable
+    /// when `policy.settleReads` is non-empty.
+    func refreshMode() async
+
+    /// Re-read just the battery. Called only by the battery poll, so only
+    /// reachable when `policy.batteryInterval` is non-nil.
+    func refreshBattery() async
+
+    var policy: BackendPolicy { get }
+}
+
+/// Fans one device's events out to every concurrent waiter.
+///
+/// Identical in shape and purpose to `FrameHub` in `GaiaClient.swift`, one
+/// level up: that one fans out `GaiaFrame`, this one fans out `DeviceEvent`.
+/// Both backends need it, so it lives here.
+public final class EventHub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<DeviceEvent>.Continuation] = [:]
+
+    public init() {}
+
+    public func stream() -> AsyncStream<DeviceEvent> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .unbounded) { continuation in
+            lock.withLock { continuations[id] = continuation }
+            continuation.onTermination = { [weak self] _ in
+                self?.lock.withLock { _ = self?.continuations.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    public func yield(_ event: DeviceEvent) {
+        let targets = lock.withLock { Array(continuations.values) }
+        for continuation in targets { continuation.yield(event) }
+    }
+}
