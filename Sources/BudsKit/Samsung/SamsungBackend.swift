@@ -231,13 +231,16 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     }
 
     private func openLink() async {
-        guard let adopted else { return }
+        // Named `ref`, not `adopted`, so it cannot shadow the property: a local
+        // by that name is what made an earlier version of the re-checks below
+        // compare `intended` to itself and silently pass.
+        guard let ref = self.adopted else { return }
         guard channel == nil else { return }
         guard !isOpening else { return }
         isOpening = true
         defer { isOpening = false }
 
-        guard let device = IOBluetoothDevice(addressString: adopted.id) else {
+        guard let device = IOBluetoothDevice(addressString: ref.id) else {
             report(.failed("These earbuds are not paired with this Mac."))
             return
         }
@@ -256,11 +259,12 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
             }
         }
 
-        // Captured before the suspension point below. `adopted` here is the
-        // non-optional local bound by the `guard let` above, so every re-check
-        // after an await must say `self.adopted` — comparing the local would be
-        // comparing `intended` to itself.
-        let intended = adopted
+        // A snapshot of which device this call is for, taken before the
+        // suspension point below. `self.adopted` is the *live* value and can
+        // change across that await — `disconnect()` nils it, `adopt(otherRef)`
+        // replaces it — so comparing the two afterwards is the whole mechanism
+        // that stops a resumed call acting for a device the user has left.
+        let intended = ref
 
         // Unfiltered on purpose: an SDP query with UUIDs specified silently
         // fails on macOS Ventura and later.
