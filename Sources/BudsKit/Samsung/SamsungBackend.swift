@@ -43,6 +43,15 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     private var reassembler = SppReassembler()
 
     private var sdpQueryContinuation: CheckedContinuation<Bool, Never>?
+
+    /// Distinguishes one SDP query from the next, so a timeout belonging to a
+    /// finished query cannot resume the one currently in flight. Without it,
+    /// query #1 completing quickly and query #2 starting on the retry path
+    /// inside the 3 s window lets #1's orphaned timeout fail #2 — reported to
+    /// the user as an unreadable service list on hardware whose SDP is fine.
+    private var sdpGeneration: UInt64 = 0
+    private var sdpTimeoutTask: Task<Void, Never>?
+
     private var connectNotification: IOBluetoothUserNotification?
     private var openAttempt = 0
     private var retryTask: Task<Void, Never>?
@@ -97,7 +106,10 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     }
 
     public func adopt(_ ref: DeviceRef) {
-        guard adopted != ref else { return }
+        // Re-selecting the same device is a *retry* whenever there is no live
+        // channel to protect — after a `.failed(…)` it is the only way back,
+        // and swallowing it leaves the user with a dead picker.
+        guard adopted != ref || channel == nil else { return }
         disconnect()
         adopted = ref
         armConnectNotification()
@@ -111,6 +123,12 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         openAttempt = 0
         closeChannel()
         device = nil
+        // `disconnect()` means "stop owning this device", so dropping the
+        // reconnect arm is intended, not collateral: an unregistered
+        // notification is also the only way IOBluetooth stops retaining `self`.
+        // `start()` and `adopt()` both re-arm, so nothing is lost.
+        connectNotification?.unregister()
+        connectNotification = nil
     }
 
     private func closeChannel() {
@@ -171,9 +189,10 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
             return DiscoveredDevice(
                 id: DeviceRef(backend: Self.id, id: address),
                 name: name,
-                // Named *and* publishing is as sure as this gets without
-                // connecting; either alone still belongs in the list.
-                isLikelyMatch: named || publishes
+                // Unconditional, and honest: the guard above already dropped
+                // everything that passes neither test, so whatever reaches
+                // here is a likely match by definition.
+                isLikelyMatch: true
             )
         }
         .sorted { $0.name < $1.name }
@@ -237,10 +256,25 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
             }
         }
 
+        // Captured before the suspension point below.
+        let intended = adopted
+
         // Unfiltered on purpose: an SDP query with UUIDs specified silently
         // fails on macOS Ventura and later.
         guard await performSDPQuery(device) else {
             report(.failed("Could not read the earbuds' service list."))
+            return
+        }
+
+        // Re-validated after the await, and this is load-bearing. `disconnect()`
+        // or `adopt(otherRef)` can run while the SDP query is in flight, and
+        // `isOpening` swallows the replacement `openLink()` — so without this a
+        // resumed call opens a channel to a device the user has already left,
+        // assigns it to `self.channel` (making every identity guard downstream
+        // pass), and the newly selected earbuds never connect.
+        guard adopted == intended, channel == nil else {
+            // `self.` because the local `let device` shadows the property here.
+            self.device = nil
             return
         }
 
@@ -264,31 +298,51 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
             scheduleOpenRetry()
             return
         }
+        // `openRFCOMMChannelAsync` is another window on the same hazard: it can
+        // return having already run the main run loop.
+        guard adopted == intended, channel == nil else {
+            opened.setDelegate(nil)
+            opened.close()
+            self.device = nil
+            return
+        }
         channel = opened
     }
 
     private func performSDPQuery(_ device: IOBluetoothDevice) async -> Bool {
-        await withCheckedContinuation { continuation in
+        sdpGeneration += 1
+        let generation = sdpGeneration
+        return await withCheckedContinuation { continuation in
             sdpQueryContinuation = continuation
             guard device.performSDPQuery(self) == kIOReturnSuccess else {
                 // Do not fail hard: the records may already be cached from a
                 // previous query, so let the lookup below decide.
-                resumeSDPQuery(true)
+                resumeSDPQuery(true, generation: generation)
                 return
             }
             // Bounded, so a query that never completes cannot strand the link.
-            Task { [weak self] in
+            // Tracked rather than fire-and-forget so that finishing a query
+            // cancels its own timeout instead of leaving it to fire into
+            // whatever query is in flight three seconds later.
+            sdpTimeoutTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(3))
-                self?.resumeSDPQuery(false)
+                self?.resumeSDPQuery(false, generation: generation)
             }
         }
     }
 
     /// Resumes exactly once, whichever of the callback or the timeout arrives
-    /// first.
-    private func resumeSDPQuery(_ success: Bool) {
+    /// first — and only for the query that is actually in flight.
+    ///
+    /// `generation` is what makes a late or duplicate arrival a no-op rather
+    /// than a wrong verdict: a stale timeout, or a completion for a device the
+    /// backend has since left, carries an older generation and is dropped.
+    private func resumeSDPQuery(_ success: Bool, generation: UInt64) {
+        guard generation == sdpGeneration else { return }
         guard let continuation = sdpQueryContinuation else { return }
         sdpQueryContinuation = nil
+        sdpTimeoutTask?.cancel()
+        sdpTimeoutTask = nil
         continuation.resume(returning: success)
     }
 
@@ -361,10 +415,16 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     /// now?". Cheaper than it sounds: SPP is a control channel and A2DP audio
     /// runs independently, so the user hears nothing.
     ///
-    /// Reached only from `DeviceController.refreshOnWake()` — `policy.settleReads`
-    /// is empty, so the settle loop never runs for this backend. That single
-    /// caller is what keeps it out of the connect path, and out of the loop
-    /// described on `refresh()` above.
+    /// Two callers, neither of them in the connect path — which is what keeps
+    /// this out of the loop described on `refresh()` above. `policy.settleReads`
+    /// is empty, so the settle loop never reaches it here.
+    ///
+    /// - `DeviceController.refreshOnWake()`, the intended one.
+    /// - `DeviceController.readMode()`, from `performSet`'s reconcile after an
+    ///   unconfirmed set. That one is heavy: a lost set tears the channel down
+    ///   and rebuilds it, SDP query included, inside the set timeout. It stays
+    ///   acceptable only because Samsung acks its sets, so the reconcile is
+    ///   rare.
     ///
     /// ponytail: the blunt instrument. If a firmware ever answers message 97 as
     /// a request, send that instead and keep the channel up.
@@ -394,6 +454,11 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     /// Synchronous also means there is no write completion to wait for, which
     /// is why this backend has no pending-write table: the return value *is*
     /// the result.
+    ///
+    /// ponytail: blocks the main actor for the duration of a write. Bounded and
+    /// tiny for a dozen bytes on an open channel; if flow control ever stalls
+    /// one (`isTransmissionPaused` exists to detect that), move `send` off the
+    /// main actor rather than going back to `writeAsync`.
     private func send(_ id: SppMessageID, _ payload: [UInt8] = []) throws {
         guard let channel, channel.isOpen() else { throw SamsungError.notConnected }
         var bytes = [UInt8](SppFrame.encode(id, payload))
@@ -438,6 +503,11 @@ extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate {
     ) {
         guard let rfcommChannel, rfcommChannel === channel else { return }
         guard error == kIOReturnSuccess, rfcommChannel.isOpen() else {
+            // Closed and un-delegated before it is dropped: nilling the
+            // reference alone leaves a failed channel holding `self` as its
+            // delegate for the life of the process.
+            rfcommChannel.setDelegate(nil)
+            rfcommChannel.close()
             channel = nil
             scheduleOpenRetry()
             return
@@ -478,7 +548,7 @@ extension SamsungBackend {
     /// takes an untyped target and calls this by selector.
     @objc(sdpQueryComplete:status:)
     func sdpQueryComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
-        resumeSDPQuery(status == kIOReturnSuccess)
+        resumeSDPQuery(status == kIOReturnSuccess, generation: sdpGeneration)
     }
 }
 
