@@ -7,8 +7,8 @@ import Observation
 /// particular radio or wire protocol lives behind that. What it does assume is
 /// that a `setMode` may never be confirmed — some devices acknowledge it, some
 /// announce the change unprompted, and some do neither — which is why
-/// `performSet` publishes optimistically, waits, and then reconciles by
-/// reading rather than trusting the write.
+/// `setMode` publishes optimistically and `performSet` waits, then reconciles
+/// by reading rather than trusting the write.
 @MainActor
 @Observable
 public final class DeviceController {
@@ -124,6 +124,12 @@ public final class DeviceController {
         state.batteryRight = nil
         state.firmware = nil
         state.lastError = nil
+        // The clear has to reach the App Group snapshot, not just the in-process
+        // observers: the Control Center widget and the intents read only that,
+        // so without this they keep showing the *previous* device's mode and
+        // battery — still marked connected — until the new backend's first
+        // `connectionChanged` publishes.
+        publish()
         start()
     }
 
