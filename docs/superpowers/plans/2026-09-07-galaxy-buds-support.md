@@ -623,6 +623,15 @@ public struct SppFrame: Equatable, Sendable {
     /// Bit 13.
     static let fragmentBit: UInt16 = 0x2000
 
+    /// Total wire length of the frame at the front of `bytes`.
+    ///
+    /// Only valid once `decode` has accepted that frame — it re-reads the
+    /// header rather than re-validating it, so the reassembler can consume
+    /// exactly the right number of bytes without parsing twice.
+    static func frameLength(_ bytes: [UInt8]) -> Int {
+        4 + Int((UInt16(bytes[1]) | UInt16(bytes[2]) << 8) & sizeMask)
+    }
+
     // MARK: - Checksum
 
     /// CRC16-CCITT/XMODEM: polynomial 0x1021, initial value 0x0000, MSB-first,
@@ -700,7 +709,7 @@ public struct SppFrame: Equatable, Sendable {
 public struct SppReassembler: Sendable {
 
     /// ponytail: a flat array with `removeFirst`, not a ring buffer. Frames are
-/// under a few dozen bytes and arrive a handful at a time; reach for a ring
+    /// under a few dozen bytes and arrive a handful at a time; reach for a ring
     /// buffer only if a profile ever shows this copying.
     private var buffer: [UInt8] = []
 
@@ -730,31 +739,43 @@ public struct SppReassembler: Sendable {
 
             guard buffer.count >= SppFrame.minimumSize else { break parse }
 
-            let header = UInt16(buffer[1]) | UInt16(buffer[2]) << 8
-            let size = Int(header & SppFrame.sizeMask)
-            let total = 4 + size
-
-            if size >= SppFrame.sizeOverhead, buffer.count < total {
-                // A plausible frame that has not finished arriving.
-                break parse
-            }
-
-            if let frame = SppFrame.decode(Array(buffer[0..<min(total, buffer.count)])) {
-                buffer.removeFirst(total)
+            if let frame = SppFrame.decode(buffer) {
+                buffer.removeFirst(SppFrame.frameLength(buffer))
                 // Fragments are consumed so the stream stays aligned, but never
                 // surfaced: they only ever carry firmware images and core dumps.
                 if !frame.isFragment { frames.append(frame) }
                 continue parse
             }
 
-            // Not a frame after all. Drop this preamble and everything up to the
-            // next one, in one step — resyncing a byte at a time would rescan
-            // from zero on every iteration.
-            guard let next = buffer[1...].firstIndex(of: SppFrame.preamble) else {
-                buffer.removeAll()
-                break parse
+            // The front will not decode. Two possibilities, and they look
+            // identical from here: a real frame that has not finished
+            // arriving, or garbage whose size field is lying to us.
+            //
+            // Tell them apart by proof, not by a heuristic on the claimed
+            // size. Resync only if a *valid* frame can be found at a later
+            // preamble; otherwise keep waiting for more bytes.
+            //
+            // A size cap was tried first and rejected: adjacent garbage
+            // trivially produces a claim just under any fixed bound (a pair of
+            // stray 0xFD bytes claims 253, sliding under a 256 cap), so the
+            // cap only moves the stall rather than removing it.
+            //
+            // ponytail: O(n²) over adversarial garbage, bounded by
+            // `bufferLimit` below — 4 KB on a channel that carries a few dozen
+            // bytes a minute. Index-based decoding would remove the slice copy
+            // if a profile ever shows it.
+            var probe = 1
+            var resyncTo: Int?
+            while probe < buffer.count {
+                guard let next = buffer[probe...].firstIndex(of: SppFrame.preamble) else { break }
+                if SppFrame.decode(Array(buffer[next...])) != nil {
+                    resyncTo = next
+                    break
+                }
+                probe = next + 1
             }
-            buffer.removeFirst(next)
+            guard let resyncTo else { break parse }
+            buffer.removeFirst(resyncTo)
         }
 
         // Checked after parsing, never before: clearing first would throw away
@@ -1110,7 +1131,9 @@ and change the `discovered` declaration to `private var discovered: [DeviceRef: 
 
 In `beginScan()`, `Dictionary(uniqueKeysWithValues:)` still works unchanged.
 
-Remove the now-unused `import`-level use of `bridge` if `StateBridge` is no longer referenced anywhere in the file; if `bridge` becomes unused, delete the stored property and the `init(bridge:)` parameter, and update `CLI.swift`'s `lazy var client = GaiaClient(bridge: bridge)` to `GaiaClient()`.
+**Remove `GaiaClient`'s `bridge` dependency entirely.** After the changes above, nothing in the file uses it: `attemptConnect` reads `adopted` instead of `bridge.deviceRef`, and `select`/`forgetDevice` — the only other users — are deleted. So delete the `bridge` stored property and the `init(bridge:)` parameter, leaving `GaiaClient()`, and update `CLI.swift`'s `lazy var client = GaiaClient(bridge: bridge)` to `GaiaClient()`.
+
+This is settled, not conditional: Task 9 assumes `GaiaClient()` takes no arguments. Do not leave the parameter in place "just in case".
 
 - [ ] **Step 4: Fix the CLI**
 
@@ -2711,7 +2734,7 @@ git commit -m "feat: add SamsungBackend over IOBluetooth RFCOMM"
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–8.
-- Produces: `Backends.all(bridge:) -> [any EarbudsBackend]`. `AppModel.devices: [DiscoveredDevice]`, `AppModel.select(_ device: DiscoveredDevice)`, `AppModel.forget()`, `AppModel.refreshDevices()`, `AppModel.startScan()`, `AppModel.stopScan()`, `AppModel.selectedRef: DeviceRef?`.
+- Produces: `Backends.all() -> [any EarbudsBackend]`. `AppModel.devices: [DiscoveredDevice]`, `AppModel.select(_ device: DiscoveredDevice)`, `AppModel.forget()`, `AppModel.refreshDevices()`, `AppModel.startScan()`, `AppModel.stopScan()`, `AppModel.selectedRef: DeviceRef?`.
 
 - [ ] **Step 1: Add the registry**
 
@@ -2726,7 +2749,9 @@ public enum Backends {
     /// All of them are started so both brands show up in Settings; only the one
     /// owning the user's saved device is adopted.
     @MainActor
-    public static func all(bridge: StateBridge) -> [any EarbudsBackend] {
+    public static func all() -> [any EarbudsBackend] {
+        // GaiaBackend needs the client twice over: as its data plane (a
+        // GaiaTransport) and as its connection plane. Same object, two roles.
         let client = GaiaClient()
         return [
             GaiaBackend(transport: client, client: client),
@@ -2736,7 +2761,7 @@ public enum Backends {
 }
 ```
 
-If `GaiaClient.init` still takes a `bridge` after Task 4, pass it; if the parameter was removed there, drop the unused `bridge` argument from this function too and update the call in `AppModel`.
+No `bridge` parameter: Task 4 removed `GaiaClient`'s dependency on it, and nothing else here needs one. `StateBridge` is still what `DeviceController` publishes through — it is just no longer a backend's business.
 
 - [ ] **Step 2: Rewrite `AppModel`'s wiring**
 
@@ -2762,7 +2787,7 @@ final class AppModel {
 
     init() {
         let bridge = StateBridge.shared
-        let backends = Backends.all(bridge: bridge)
+        let backends = Backends.all()
         self.bridge = bridge
         self.backends = backends
 
