@@ -2949,6 +2949,15 @@ Replace the device-management methods at the end of `AppModel`:
         // notifications can no longer reach the controller. `DeviceController.use`
         // deliberately does *not* do this — the caller owns it, because only the
         // caller knows which other backends exist.
+        //
+        // **This loop is an invariant `SamsungBackend` depends on, not just
+        // tidiness.** Its `openLink()` re-drives itself when it notices a
+        // different device was adopted while it was suspended over an SDP
+        // query. That re-drive is safe against the user switching to the *other
+        // backend* only because `disconnect()` nils that backend's `adopted`,
+        // which makes the re-drive condition false. Skip this loop and a
+        // de-selected Samsung backend would keep trying to reconnect the wrong
+        // earbuds underneath the one the user actually picked.
         for backend in backends where type(of: backend).id != device.id.backend {
             backend.disconnect()
         }
