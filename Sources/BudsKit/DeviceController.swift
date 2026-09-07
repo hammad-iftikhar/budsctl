@@ -3,9 +3,12 @@ import Observation
 
 /// Sole owner and sole writer of `DeviceState`.
 ///
-/// Everything here assumes the device's two documented quirks: `setMode`
-/// produces no reply, and the confirming `0x0310` arrives unsolicited about
-/// 1.4 s later — or never.
+/// Device-agnostic: it speaks only `EarbudsBackend`, and every quirk of a
+/// particular radio or wire protocol lives behind that. What it does assume is
+/// that a `setMode` may never be confirmed — some devices acknowledge it, some
+/// announce the change unprompted, and some do neither — which is why
+/// `performSet` publishes optimistically, waits, and then reconciles by
+/// reading rather than trusting the write.
 @MainActor
 @Observable
 public final class DeviceController {
