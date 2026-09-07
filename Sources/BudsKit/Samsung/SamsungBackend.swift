@@ -15,15 +15,13 @@ import IOBluetooth
 ///    values; `rfcommChannelData` arrives as arbitrary chunks. `SppReassembler`
 ///    owns that problem.
 ///
-/// Deliberately **not** an `NSObject` subclass, even though IOBluetooth is
-/// selector-driven: `EarbudsBackend.release()` and `NSObject.release()` are the
-/// same Swift signature, so the compiler sees two exact witnesses and refuses
-/// the conformance — and nothing on the conforming side can disambiguate it
-/// (`@objc(otherSelector)` does not, and renaming the protocol requirement
-/// would reach into every backend and call site). The `@objc` surface
-/// IOBluetooth needs therefore lives on `SamsungRadio` below, which forwards.
+/// An `NSObject` subclass because IOBluetooth is selector-driven: the connect
+/// notification, the SDP query and the RFCOMM channel all call back by
+/// selector, so this type has to be visible to the ObjC runtime. That is also
+/// why `EarbudsBackend` spells its teardown hook `disconnect()` — see the note
+/// on that requirement.
 @MainActor
-public final class SamsungBackend: EarbudsBackend {
+public final class SamsungBackend: NSObject, EarbudsBackend {
 
     public static let id = "samsung"
     public static let displayName = "Samsung"
@@ -44,10 +42,6 @@ public final class SamsungBackend: EarbudsBackend {
     private var channel: IOBluetoothRFCOMMChannel?
     private var reassembler = SppReassembler()
 
-    /// The `@objc` target IOBluetooth calls back on. Held strongly for this
-    /// backend's whole life; it holds the backend weakly.
-    private let radio = SamsungRadio()
-
     private var sdpQueryContinuation: CheckedContinuation<Bool, Never>?
     private var connectNotification: IOBluetoothUserNotification?
     private var openAttempt = 0
@@ -66,20 +60,6 @@ public final class SamsungBackend: EarbudsBackend {
     /// right rather than merely safe: it would have opened the same channel to
     /// the same device the in-flight call is already opening.
     private var isOpening = false
-
-    /// One writer awaiting its `rfcommChannelWriteComplete`.
-    ///
-    /// Keyed by `refcon` rather than by FIFO position, for the same reason
-    /// `GaiaClient.PendingWrite` carries an id: a write that times out can then
-    /// remove *itself* without desynchronising everyone behind it.
-    private var pendingWrites: [UInt64: CheckedContinuation<Void, Error>] = [:]
-    private var lastWriteID: UInt64 = 0
-
-    /// Bounds every write in time. IOBluetooth is supposed to always call
-    /// `rfcommChannelWriteComplete`, but a stale continuation would take the
-    /// next write's completion and deadlock every write from then on, and a
-    /// `CheckedContinuation` held in a dictionary produces no runtime warning.
-    private static let writeTimeout: Duration = .seconds(5)
 
     /// Retry offsets for an RFCOMM open that fails while the baseband link is
     /// up — usually buds still settling after leaving the case. Bounded, so a
@@ -103,8 +83,8 @@ public final class SamsungBackend: EarbudsBackend {
          0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb],
     ]
 
-    public init() {
-        radio.owner = self
+    public override init() {
+        super.init()
     }
 
     // MARK: - Lifecycle
@@ -118,13 +98,13 @@ public final class SamsungBackend: EarbudsBackend {
 
     public func adopt(_ ref: DeviceRef) {
         guard adopted != ref else { return }
-        release()
+        disconnect()
         adopted = ref
         armConnectNotification()
         Task { await openLink() }
     }
 
-    public func release() {
+    public func disconnect() {
         retryTask?.cancel()
         retryTask = nil
         adopted = nil
@@ -139,10 +119,8 @@ public final class SamsungBackend: EarbudsBackend {
         channel.close()
         self.channel = nil
         reassembler = SppReassembler()
-        // Not optional. A leaked continuation would take the next write's
-        // completion and deadlock every write after it — the same hazard
-        // `GaiaClient.releasePeripheral` documents.
-        failPendingWrites(SamsungError.notConnected)
+        // Nothing else to unwind: `send` is synchronous, so there is never a
+        // write in flight across a suspension for this to have to fail.
     }
 
     private func report(_ state: ConnectionState) {
@@ -218,12 +196,16 @@ public final class SamsungBackend: EarbudsBackend {
         // replacement for CoreBluetooth's queued connect, which IOBluetooth
         // does not offer.
         connectNotification = IOBluetoothDevice.register(
-            forConnectNotifications: radio,
-            selector: #selector(SamsungRadio.deviceConnected(_:device:))
+            forConnectNotifications: self,
+            selector: #selector(deviceConnected(_:device:))
         )
     }
 
-    fileprivate func handleDeviceConnected(_ device: IOBluetoothDevice) {
+    /// Fires when any paired device forms a baseband connection.
+    @objc private func deviceConnected(
+        _ notification: IOBluetoothUserNotification,
+        device: IOBluetoothDevice
+    ) {
         guard let adopted, device.addressString == adopted.id else { return }
         openAttempt = 0
         Task { await openLink() }
@@ -272,7 +254,7 @@ public final class SamsungBackend: EarbudsBackend {
         let status = device.openRFCOMMChannelAsync(
             &opened,
             withChannelID: channelID,
-            delegate: radio
+            delegate: self
         )
         // Readiness is reported from `rfcommChannelOpenComplete`, never from
         // this return value: the reference implementation documents it coming
@@ -288,7 +270,7 @@ public final class SamsungBackend: EarbudsBackend {
     private func performSDPQuery(_ device: IOBluetoothDevice) async -> Bool {
         await withCheckedContinuation { continuation in
             sdpQueryContinuation = continuation
-            guard device.performSDPQuery(radio) == kIOReturnSuccess else {
+            guard device.performSDPQuery(self) == kIOReturnSuccess else {
                 // Do not fail hard: the records may already be cached from a
                 // previous query, so let the lookup below decide.
                 resumeSDPQuery(true)
@@ -355,7 +337,7 @@ public final class SamsungBackend: EarbudsBackend {
     // MARK: - Actions
 
     public func setMode(_ mode: ANCMode) async throws {
-        try await send(.noiseControls, [mode.rawValue])
+        try send(.noiseControls, [mode.rawValue])
     }
 
     /// Deliberately does nothing.
@@ -397,78 +379,33 @@ public final class SamsungBackend: EarbudsBackend {
     /// `STATUS_UPDATED` on every battery change.
     public func refreshBattery() async {}
 
-    private func send(_ id: SppMessageID, _ payload: [UInt8] = []) async throws {
-        let data = SppFrame.encode(id, payload)
-        try await withCheckedThrowingContinuation { continuation in
-            submitWrite(data, continuation)
-        }
-    }
-
-    /// Recording the continuation and calling `writeAsync` happen in one
-    /// main-actor step, so a completion cannot arrive before its `refcon` is in
-    /// the table.
-    private func submitWrite(
-        _ data: Data,
-        _ continuation: CheckedContinuation<Void, Error>
-    ) {
-        guard let channel, channel.isOpen() else {
-            continuation.resume(throwing: SamsungError.notConnected)
-            return
-        }
-        lastWriteID += 1
-        let id = lastWriteID
-        pendingWrites[id] = continuation
-
-        // Chunked to the channel MTU. Every message this app sends is under a
-        // dozen bytes, so the loop never runs twice — kept because dropping it
-        // would silently truncate if a longer message is ever added.
-        var bytes = [UInt8](data)
+    /// Chunked to the channel MTU. Every message this app sends is under a
+    /// dozen bytes, so the loop never runs twice — kept because dropping it
+    /// would silently truncate if a longer message is ever added.
+    ///
+    /// `writeSync`, deliberately, not `writeAsync`. The async variant takes a
+    /// pointer it may read after returning, and a Swift buffer pointer is only
+    /// guaranteed valid inside its closure — the header promises only that the
+    /// data "was buffered", and states elsewhere that IOBluetooth does not
+    /// buffer. This blocks until the bytes reach the hardware, so there is no
+    /// lifetime question. The cost is a bounded main-actor block on a payload
+    /// that is never more than a dozen bytes.
+    ///
+    /// Synchronous also means there is no write completion to wait for, which
+    /// is why this backend has no pending-write table: the return value *is*
+    /// the result.
+    private func send(_ id: SppMessageID, _ payload: [UInt8] = []) throws {
+        guard let channel, channel.isOpen() else { throw SamsungError.notConnected }
+        var bytes = [UInt8](SppFrame.encode(id, payload))
         let mtu = Int(channel.getMTU())
-        var status = kIOReturnSuccess
-        while !bytes.isEmpty, status == kIOReturnSuccess {
-            let count = min(bytes.count, mtu)
-            var chunk = Array(bytes.prefix(count))
-            status = chunk.withUnsafeMutableBufferPointer { buffer in
-                channel.writeAsync(
-                    buffer.baseAddress,
-                    length: UInt16(count),
-                    refcon: UnsafeMutableRawPointer(bitPattern: UInt(id))
-                )
-            }
-            bytes.removeFirst(count)
+        var offset = 0
+        while offset < bytes.count {
+            let count = min(mtu, bytes.count - offset)
+            let status: IOReturn = bytes[offset..<(offset + count)]
+                .withUnsafeMutableBufferPointer { channel.writeSync($0.baseAddress, length: UInt16(count)) }
+            guard status == kIOReturnSuccess else { throw SamsungError.writeFailed }
+            offset += count
         }
-
-        guard status == kIOReturnSuccess else {
-            completeWrite(id, error: SamsungError.writeFailed)
-            return
-        }
-
-        // Not a retry and not a poll: it only ever resumes a continuation that
-        // is still waiting, so nothing is re-sent to the device.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: Self.writeTimeout)
-            self?.completeWrite(id, error: SamsungError.writeFailed)
-        }
-    }
-
-    /// Resumes `id` only if it is still pending. Whoever gets here first —
-    /// completion, timeout, or teardown — removes the entry before resuming,
-    /// which is what makes a double resume impossible.
-    private func completeWrite(_ id: UInt64, error: Error?) {
-        guard let continuation = pendingWrites.removeValue(forKey: id) else { return }
-        if let error {
-            continuation.resume(throwing: error)
-        } else {
-            continuation.resume()
-        }
-    }
-
-    /// Drains everything, resuming each entry exactly once. Cleared before any
-    /// resume so a re-entrant call cannot see the same entry twice.
-    private func failPendingWrites(_ error: Error) {
-        let waiting = pendingWrites
-        pendingWrites.removeAll()
-        for continuation in waiting.values { continuation.resume(throwing: error) }
     }
 }
 
@@ -479,16 +416,19 @@ public enum SamsungError: Error, Equatable {
 
 // MARK: - Radio callbacks
 
-/// Everything IOBluetooth hands back, one method per callback.
+/// Everything IOBluetooth hands back.
 ///
-/// Each one re-checks that the channel it was given is the channel this backend
-/// currently owns. Without that guard a channel the user de-selected — closing
-/// asynchronously, still delivering — can feed state for the wrong device, a
-/// bug `GaiaClient`'s peripheral guards exist because of.
-extension SamsungBackend {
+/// Each channel callback re-checks that the channel it was given is the channel
+/// this backend currently owns. Without that guard a channel the user
+/// de-selected — closing asynchronously, still delivering — can feed state for
+/// the wrong device, a bug `GaiaClient`'s peripheral guards exist because of.
+///
+/// There is no `rfcommChannelWriteComplete`: `send` is synchronous, so nothing
+/// is waiting to hear about a write.
+extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate {
 
-    fileprivate func handleOpenComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel?,
+    public func rfcommChannelOpenComplete(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
         status error: IOReturn
     ) {
         guard let rfcommChannel, rfcommChannel === channel else { return }
@@ -502,102 +442,38 @@ extension SamsungBackend {
         // Announce ourselves, the way the reference implementation does on
         // connect. The buds push EXTENDED_STATUS_UPDATED without being asked,
         // so nothing here requests state.
-        Task { try? await send(.managerInfo, [0x01, 0x02, 0x22]) }
+        try? send(.managerInfo, [0x01, 0x02, 0x22])
     }
 
-    fileprivate func handleData(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel?,
-        _ chunk: Data
+    public func rfcommChannelData(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
+        data dataPointer: UnsafeMutableRawPointer!,
+        length dataLength: Int
     ) {
         guard let rfcommChannel, rfcommChannel === channel else { return }
+        guard let dataPointer, dataLength > 0 else { return }
+        let chunk = Data(bytes: dataPointer, count: dataLength)
         for frame in reassembler.append(chunk) {
             frameHub.yield(frame)
             for event in frame.events { hub.yield(event) }
         }
     }
 
-    fileprivate func handleWriteComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel?,
-        refcon: UnsafeMutableRawPointer?,
-        status error: IOReturn
-    ) {
-        guard let rfcommChannel, rfcommChannel === channel else { return }
-        let id = UInt64(UInt(bitPattern: refcon))
-        completeWrite(id, error: error == kIOReturnSuccess ? nil : SamsungError.writeFailed)
-    }
-
-    fileprivate func handleClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel?) {
+    public func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
         guard let rfcommChannel, rfcommChannel === channel else { return }
         closeChannel()
         // Wait for the next connect notification rather than spinning. The buds
         // are usually back in the case.
         report(.waiting)
     }
-
-    fileprivate func handleSDPQueryComplete(status error: IOReturn) {
-        resumeSDPQuery(error == kIOReturnSuccess)
-    }
 }
 
-/// The `@objc` half of the backend: an `NSObject` so IOBluetooth can reach it
-/// by selector, and nothing else.
-///
-/// Exists only because `SamsungBackend` cannot itself be an `NSObject`
-/// subclass — see the note on that class. Holds its owner weakly, so the
-/// backend's `radio` reference is not a cycle.
-///
-/// ponytail: hand-written forwarding, six methods of it. Collapse it back into
-/// the backend the day `EarbudsBackend.release()` is renamed to something that
-/// does not collide with `NSObject.release()`.
-@MainActor
-final class SamsungRadio: NSObject {
-
-    weak var owner: SamsungBackend?
-
-    /// Fires when any paired device forms a baseband connection.
-    @objc func deviceConnected(
-        _ notification: IOBluetoothUserNotification,
-        device: IOBluetoothDevice
-    ) {
-        owner?.handleDeviceConnected(device)
-    }
-
+extension SamsungBackend {
     /// SDP query completion. Declared `@objc` because `performSDPQuery(_:)`
     /// takes an untyped target and calls this by selector.
     @objc(sdpQueryComplete:status:)
     func sdpQueryComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
-        owner?.handleSDPQueryComplete(status: status)
-    }
-}
-
-extension SamsungRadio: @MainActor IOBluetoothRFCOMMChannelDelegate {
-
-    func rfcommChannelOpenComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        status error: IOReturn
-    ) {
-        owner?.handleOpenComplete(rfcommChannel, status: error)
-    }
-
-    func rfcommChannelData(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        data dataPointer: UnsafeMutableRawPointer!,
-        length dataLength: Int
-    ) {
-        guard let dataPointer, dataLength > 0 else { return }
-        owner?.handleData(rfcommChannel, Data(bytes: dataPointer, count: dataLength))
-    }
-
-    func rfcommChannelWriteComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        refcon: UnsafeMutableRawPointer!,
-        status error: IOReturn
-    ) {
-        owner?.handleWriteComplete(rfcommChannel, refcon: refcon, status: error)
-    }
-
-    func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
-        owner?.handleClosed(rfcommChannel)
+        resumeSDPQuery(status == kIOReturnSuccess)
     }
 }
 

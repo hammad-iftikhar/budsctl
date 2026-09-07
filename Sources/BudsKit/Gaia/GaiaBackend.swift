@@ -57,7 +57,7 @@ public final class GaiaBackend: EarbudsBackend {
         pump = Task { [weak self] in
             for await frame in frames {
                 // AsyncStream.next() does not itself observe cancellation — a
-                // frame already buffered before `release()` ran would still
+                // frame already buffered before `disconnect()` ran would still
                 // resume this loop otherwise, and reach `hub` after the
                 // backend was told to stop. Checked first, so a cancelled pump
                 // forwards nothing rather than one last frame.
@@ -67,10 +67,10 @@ public final class GaiaBackend: EarbudsBackend {
         }
     }
 
-    public func release() {
+    public func disconnect() {
         pump?.cancel()
         pump = nil
-        client?.release()
+        client?.disconnect()
     }
 
     public func adopt(_ ref: DeviceRef) {

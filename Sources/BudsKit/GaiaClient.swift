@@ -125,7 +125,7 @@ public final class GaiaClient: NSObject, GaiaTransport {
     }
 
     /// Drop the link and stop reporting.
-    public func release() {
+    public func disconnect() {
         adopted = nil
         releasePeripheral()
     }
@@ -363,7 +363,7 @@ extension GaiaClient: @MainActor CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         // A released peripheral can still complete a connect that was in
-        // flight before `release()` ran. Ignore it — `attemptConnect` is
+        // flight before `disconnect()` ran. Ignore it — `attemptConnect` is
         // the only place that adopts a peripheral.
         guard peripheral === self.peripheral else { return }
         deviceName = peripheral.name

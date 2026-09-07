@@ -137,7 +137,15 @@ public protocol EarbudsBackend: AnyObject {
     /// behind that can still mutate state — a de-selected device's
     /// notifications reaching `DeviceController` is a bug with history on the
     /// GAIA side.
-    func release()
+    ///
+    /// **Not** named `release()`, and do not rename it back. IOBluetooth is
+    /// selector-driven, so a Classic backend has to be an `NSObject` subclass —
+    /// and `NSObject.release()` is a witness candidate for a protocol
+    /// requirement of that name even though ARC makes it unavailable. Two exact
+    /// candidates means no conformance, from the *protocol* side, with nothing
+    /// the backend can do about it. `disconnect()` says what it does anyway:
+    /// this drops a device, not a retain count.
+    func disconnect()
 
     /// A **fresh** stream per caller.
     ///

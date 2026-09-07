@@ -151,7 +151,7 @@ struct GaiaBackendTests {
         let transport = FakeTransport()
         let backend = GaiaBackend(transport: transport)
         backend.start()
-        backend.release()
+        backend.disconnect()
         let stream = backend.events()
         transport.emitModeChange(.anc)
         let raced = await withTimeout(.milliseconds(200)) { () -> DeviceEvent? in
