@@ -25,6 +25,7 @@
 - Commit after every task. Conventional-commit prefixes (`feat:`, `refactor:`, `test:`, `docs:`, `fix:`).
 - **No `Co-Authored-By` trailer and no AI attribution in commit messages or PR bodies.**
 - Deliberate simplifications get a `ponytail:` comment naming the ceiling and the upgrade path, matching the existing house style.
+- **`App/` and `Controls/` are Xcode-only targets — they are NOT in `Package.swift`, so `swift build` and `swift test` never compile them.** This matters: Task 4 deletes `GaiaClient.select(_:)`, `forgetDevice()` and `init(bridge:)`, all three of which `App/BudsCtlApp.swift` calls. **The Xcode app target is therefore knowingly broken from Task 4 until Task 9 rewires `AppModel`.** Tasks 4-8 verify with `swift build` + `swift test` only and must NOT patch `App/` to make Xcode happy — that is Task 9's job, and a throwaway shim would only be rewritten. Do not report this as BLOCKED.
 
 ## Two deliberate deviations from the spec
 
@@ -2749,12 +2750,14 @@ IOBluetooth is an old ObjC framework, so expect friction here. Fix diagnostics w
 
 Do **not** silence a diagnostic with `nonisolated(unsafe)` or `@unchecked Sendable` on `SamsungBackend` itself. If isolation genuinely cannot be expressed, stop and report it.
 
-- [ ] **Step 4: Verify the app target builds**
+- [ ] **Step 4: Confirm `project.yml` parses — do NOT expect the app to build**
 
-Run: `xcodegen generate && xcodebuild -project BudsCtl.xcodeproj -scheme BudsCtl -configuration Debug build 2>&1 | tail -20`
-Expected: `BUILD SUCCEEDED`.
+Run: `xcodegen generate 2>&1 | tail -5`
+Expected: generation succeeds, proving the `IOBluetooth.framework` dependency you added is well-formed.
 
-If `xcodegen` is unavailable, run `swift build` only and note that the Xcode build is deferred to Task 9, which has to regenerate the project anyway.
+**Do not run `xcodebuild` and do not expect the app target to compile.** It cannot: `App/BudsCtlApp.swift` still calls `GaiaClient.select(_:)`, `forgetDevice()` and `init(bridge:)`, which Task 4 deleted. That breakage is expected and is Task 9's to repair — see the Global Constraints. **Do not patch `App/` to work around it.**
+
+Your build gate for this task is `swift build` (Step 3), which does compile `BudsKit` including `SamsungBackend`. If `xcodegen` is not installed, skip this step and say so in your report; Task 9 regenerates the project anyway.
 
 - [ ] **Step 5: Run the suite**
 
