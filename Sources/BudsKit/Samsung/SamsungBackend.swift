@@ -398,6 +398,11 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         guard let channel, channel.isOpen() else { throw SamsungError.notConnected }
         var bytes = [UInt8](SppFrame.encode(id, payload))
         let mtu = Int(channel.getMTU())
+        // A zero MTU would make `count` zero and spin this loop forever on the
+        // main actor — a hung menu bar with no crash to report. Unreachable
+        // behind `isOpen()`, guarded anyway because the cost of being wrong is
+        // a beachball and the cost of the guard is one line.
+        guard mtu > 0 else { throw SamsungError.writeFailed }
         var offset = 0
         while offset < bytes.count {
             let count = min(mtu, bytes.count - offset)
