@@ -33,7 +33,15 @@ struct SettingsView: View {
     /// kinds of earbuds.
     private var groups: [(vendor: String, devices: [DiscoveredDevice])] {
         Dictionary(grouping: visible) { $0.id.backend }
-            .map { (vendor: Self.vendorName($0.key), devices: $0.value.sorted { $0.name < $1.name }) }
+            .map { group in
+                (vendor: Self.vendorName(group.key),
+                 // Tie-broken on the ref for the same reason `mergeDiscovered`
+                 // is: Swift's sort is not stable, so two same-model pairs
+                 // would otherwise swap rows between updates.
+                 devices: group.value.sorted {
+                     ($0.name, $0.id.persistedForm) < ($1.name, $1.id.persistedForm)
+                 })
+            }
             .sorted { $0.vendor < $1.vendor }
     }
 
