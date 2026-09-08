@@ -9,16 +9,23 @@ struct DeviceControllerTests {
     private func makeController(
         mode: ANCMode = .normal,
         applyDelay: Duration = .milliseconds(30)
-    ) -> (DeviceController, FakeTransport, StateBridge) {
+    ) -> (DeviceController, FakeTransport, GaiaBackend, StateBridge) {
         let transport = FakeTransport(mode: mode, applyDelay: applyDelay)
+        let backend = GaiaBackend(transport: transport)
+        // Off by default so no test waits out the real 2 s first re-read; the
+        // tests that exercise settling set their own schedule.
+        backend.policy = BackendPolicy()
+        // Starts the frame-to-event pump. Without it nothing the fake transport
+        // emits ever reaches the controller's event stream.
+        backend.start()
         let suite = "budsctl.test.\(UUID().uuidString)"
         let bridge = StateBridge(defaults: UserDefaults(suiteName: suite)!)
-        let controller = DeviceController(transport: transport, bridge: bridge)
+        let controller = DeviceController(backend: backend, bridge: bridge)
         controller.setTimeout = .milliseconds(300)
         controller.state.connection = .ready
         controller.state.mode = mode
         controller.start()
-        return (controller, transport, bridge)
+        return (controller, transport, backend, bridge)
     }
 
     /// Counts `onStateChanged` calls. MainActor-isolated, so it is Sendable
@@ -43,7 +50,7 @@ struct DeviceControllerTests {
     @Test("the pending mode is visible immediately, before the device confirms")
     func optimisticUpdateIsSynchronous() async throws {
         // A realistic 1.4 s delay: the whole point is that the UI must not wait.
-        let (controller, _, _) = makeController(applyDelay: .milliseconds(1400))
+        let (controller, _, _, _) = makeController(applyDelay: .milliseconds(1400))
         controller.setMode(.anc)
         // No await between setMode and this assertion.
         #expect(controller.state.pendingMode == .anc)
@@ -55,7 +62,7 @@ struct DeviceControllerTests {
 
     @Test("a set is confirmed by the delayed unsolicited notification")
     func confirmOnNotification() async throws {
-        let (controller, transport, bridge) = makeController()
+        let (controller, transport, _, bridge) = makeController()
         controller.setMode(.anc)
         try await until("mode confirmed") { controller.state.mode == .anc }
         #expect(controller.state.pendingMode == nil)
@@ -68,7 +75,7 @@ struct DeviceControllerTests {
 
     @Test("no notification falls back to one getter read")
     func fallbackPoll() async throws {
-        let (controller, transport, _) = makeController()
+        let (controller, transport, _, _) = makeController()
         transport.swallowSetNotification = true
         // The device applied the change but never announced it. `swallowSetNotification`
         // alone leaves the fake's internal mode untouched, so say what getMode reports.
@@ -86,7 +93,7 @@ struct DeviceControllerTests {
 
     @Test("a device that ignores the set is reported honestly, not optimistically")
     func deviceRefusedTheChange() async throws {
-        let (controller, transport, _) = makeController(mode: .normal)
+        let (controller, transport, _, _) = makeController(mode: .normal)
         transport.swallowSetNotification = true
         transport.reportedModeOverride = .normal   // device stayed put
         controller.setMode(.anc)
@@ -98,7 +105,7 @@ struct DeviceControllerTests {
 
     @Test("a write failure surfaces an error and clears the optimistic state")
     func writeFailure() async throws {
-        let (controller, transport, _) = makeController()
+        let (controller, transport, _, _) = makeController()
         transport.failWrites = true
         controller.setMode(.anc)
         try await until("error surfaced") { controller.state.lastError != nil }
@@ -109,7 +116,7 @@ struct DeviceControllerTests {
 
     @Test("rapid clicks coalesce to the newest target")
     func coalesceRapidClicks() async throws {
-        let (controller, transport, _) = makeController(applyDelay: .milliseconds(60))
+        let (controller, transport, _, _) = makeController(applyDelay: .milliseconds(60))
         controller.setMode(.anc)
         controller.setMode(.passthrough)
         controller.setMode(.normal)
@@ -138,7 +145,7 @@ struct DeviceControllerTests {
     // against flakiness while unambiguously distinguishing the two designs.
     @Test("a newer click's write is not held behind an older click's confirmation wait")
     func newerClickDoesNotWaitOutOlderConfirmation() async throws {
-        let (controller, transport, _) = makeController()
+        let (controller, transport, _, _) = makeController()
         transport.swallowSetNotification = true
         controller.setTimeout = .seconds(10)
 
@@ -155,7 +162,7 @@ struct DeviceControllerTests {
 
     @Test("a mode change made on the buds or the phone updates state unprompted")
     func externalModeChange() async throws {
-        let (controller, transport, bridge) = makeController(mode: .normal)
+        let (controller, transport, _, bridge) = makeController(mode: .normal)
         transport.emitModeChange(.passthrough)
         try await until("external change applied") { controller.state.mode == .passthrough }
         #expect(bridge.readSnapshot().mode == .passthrough)
@@ -166,7 +173,7 @@ struct DeviceControllerTests {
 
     @Test("cycleMode advances from the confirmed mode and wraps")
     func cycle() async throws {
-        let (controller, _, _) = makeController(mode: .passthrough)
+        let (controller, _, _, _) = makeController(mode: .passthrough)
         controller.cycleMode()
         try await until("wrapped to normal") { controller.state.mode == .normal }
         controller.cycleMode()
@@ -176,7 +183,7 @@ struct DeviceControllerTests {
 
     @Test("cycleMode with no known mode assumes normal and sets ANC")
     func cycleFromUnknown() async throws {
-        let (controller, _, _) = makeController()
+        let (controller, _, _, _) = makeController()
         controller.state.mode = nil
         controller.cycleMode()
         #expect(controller.state.pendingMode == .anc)
@@ -185,7 +192,7 @@ struct DeviceControllerTests {
 
     @Test("a bridge request is executed like a local action")
     func handleBridgeRequests() async throws {
-        let (controller, _, _) = makeController(mode: .normal)
+        let (controller, _, _, _) = makeController(mode: .normal)
         controller.handle(.setMode(.passthrough))
         try await until("set from bridge") { controller.state.mode == .passthrough }
         controller.handle(.cycleMode)
@@ -195,7 +202,7 @@ struct DeviceControllerTests {
 
     @Test("connect refresh reads firmware, mode and both batteries once each")
     func refreshAfterConnect() async throws {
-        let (controller, transport, _) = makeController(mode: .anc)
+        let (controller, transport, _, _) = makeController(mode: .anc)
         controller.state.mode = nil
         await controller.refreshAfterConnect()
         try await until("all fields populated") {
@@ -216,7 +223,7 @@ struct DeviceControllerTests {
 
     @Test("unexpected firmware is warned about, not refused")
     func firmwareWarning() async throws {
-        let (controller, transport, _) = makeController()
+        let (controller, transport, _, _) = makeController()
         transport.firmware = "AIR4PRO-BS588R2E_20991231_v9.9.9"
         await controller.refreshAfterConnect()
         try await until("warning surfaced") { controller.state.lastError != nil }
@@ -227,7 +234,7 @@ struct DeviceControllerTests {
 
     @Test("known-good firmware raises no warning")
     func firmwareOK() async throws {
-        let (controller, _, _) = makeController()
+        let (controller, _, _, _) = makeController()
         await controller.refreshAfterConnect()
         try await until("firmware read") { controller.state.firmware != nil }
         #expect(controller.state.lastError == nil)
@@ -236,7 +243,7 @@ struct DeviceControllerTests {
 
     @Test("a connect refresh cannot resurrect a connection that has since dropped")
     func refreshDoesNotResurrectReady() async throws {
-        let (controller, _, bridge) = makeController(mode: .anc)
+        let (controller, _, _, bridge) = makeController(mode: .anc)
         // Stands in for the real interleaving: connectionChanged(.ready) starts
         // this refresh, the buds go back in the case, connectionChanged(.waiting)
         // runs to completion, and only then does the refresh resume.
@@ -250,11 +257,14 @@ struct DeviceControllerTests {
     @Test("the firmware reply publishes, so its warning reaches the UI and the bridge")
     func firmwarePublishes() async throws {
         let transport = FakeTransport(mode: .anc, applyDelay: .milliseconds(30))
+        let backend = GaiaBackend(transport: transport)
+        backend.policy = BackendPolicy()
+        backend.start()
         let suite = "budsctl.test.\(UUID().uuidString)"
         let bridge = StateBridge(defaults: UserDefaults(suiteName: suite)!)
         let published = PublishCount()
         let controller = DeviceController(
-            transport: transport,
+            backend: backend,
             bridge: bridge,
             onStateChanged: { published.count += 1 }
         )
@@ -270,7 +280,7 @@ struct DeviceControllerTests {
 
     @Test("losing the connection clears live values but keeps the last known mode")
     func connectionLost() async throws {
-        let (controller, _, bridge) = makeController(mode: .anc)
+        let (controller, _, _, bridge) = makeController(mode: .anc)
         controller.state.batteryLeft = 85
         await controller.connectionChanged(.waiting)
         #expect(controller.state.connection == .waiting)
@@ -283,7 +293,7 @@ struct DeviceControllerTests {
 
     @Test("a write refused while connected reads as another device holding the buds")
     func inUseByAnotherDevice() async throws {
-        let (controller, transport, _) = makeController()
+        let (controller, transport, _, _) = makeController()
         controller.state.connection = .ready
         transport.failWrites = true
         controller.setMode(.anc)
@@ -296,7 +306,7 @@ struct DeviceControllerTests {
 
     @Test("a write that fails with no link reads as disconnected")
     func writeWithNoLink() async throws {
-        let (controller, transport, _) = makeController()
+        let (controller, transport, _, _) = makeController()
         controller.state.connection = .waiting
         transport.failWrites = true
         controller.setMode(.anc)
@@ -307,14 +317,14 @@ struct DeviceControllerTests {
 
     @Test("wake refresh re-reads mode and battery, and does nothing when not ready")
     func wakeRefresh() async throws {
-        let (controller, transport, _) = makeController(mode: .anc)
+        let (controller, transport, _, _) = makeController(mode: .anc)
         await controller.refreshOnWake()
         let commands = transport.recordedWrites().map(\.0)
         #expect(commands.contains(.getMode))
         #expect(commands.contains(.getBatteryLeft))
         #expect(commands.contains(.setMode) == false)
 
-        let (idle, idleTransport, _) = makeController()
+        let (idle, idleTransport, _, _) = makeController()
         idle.state.connection = .waiting
         await idle.refreshOnWake()
         #expect(idleTransport.recordedWrites().isEmpty)
@@ -327,8 +337,8 @@ struct DeviceControllerTests {
         // The device answers Off while it is still waking, then tells the
         // truth. It never notifies — exactly what the hardware was measured
         // doing, and the reason one read on connect is not enough.
-        let (controller, transport, _) = makeController(mode: .normal)
-        controller.settleReads = [.milliseconds(20)]
+        let (controller, transport, backend, _) = makeController(mode: .normal)
+        backend.policy.settleReads = [.milliseconds(20)]
         controller.state.mode = nil
 
         await controller.connectionChanged(.ready)
@@ -341,10 +351,10 @@ struct DeviceControllerTests {
 
     @Test("a set outranks the settle re-read, so a stale read cannot overwrite it")
     func settleDoesNotClobberAUserSet() async throws {
-        let (controller, transport, _) = makeController(mode: .normal)
+        let (controller, transport, backend, _) = makeController(mode: .normal)
         // Long enough that the re-read would land well after the set if it
         // were still armed.
-        controller.settleReads = [.milliseconds(50)]
+        backend.policy.settleReads = [.milliseconds(50)]
         await controller.connectionChanged(.ready)
 
         // The device is still stale and would report Off if asked again.
@@ -359,8 +369,8 @@ struct DeviceControllerTests {
 
     @Test("the settle re-read stops when the earbuds go away")
     func settleStopsOnDisconnect() async throws {
-        let (controller, transport, _) = makeController(mode: .normal)
-        controller.settleReads = [.milliseconds(50)]
+        let (controller, transport, backend, _) = makeController(mode: .normal)
+        backend.policy.settleReads = [.milliseconds(50)]
         await controller.connectionChanged(.ready)
         let afterConnect = transport.recordedWrites().filter { $0.0 == .getMode }.count
 
@@ -372,8 +382,8 @@ struct DeviceControllerTests {
 
     @Test("the mode reads as unresolved until the first settle read lands")
     func resolvingClearsOnFirstSettleRead() async throws {
-        let (controller, _, _) = makeController(mode: .normal)
-        controller.settleReads = [.milliseconds(30), .seconds(45)]
+        let (controller, _, backend, _) = makeController(mode: .normal)
+        backend.policy.settleReads = [.milliseconds(30), .seconds(45)]
         controller.state.mode = nil
 
         await controller.connectionChanged(.ready)
@@ -388,8 +398,8 @@ struct DeviceControllerTests {
 
     @Test("an error from the last connection is cleared when the link comes back")
     func reconnectClearsStaleError() async throws {
-        let (controller, _, _) = makeController(mode: .normal)
-        controller.settleReads = [.seconds(45)]
+        let (controller, _, backend, _) = makeController(mode: .normal)
+        backend.policy.settleReads = [.seconds(45)]
         // makeController hands back a ready link; this test needs the buds away.
         controller.state.connection = .waiting
         controller.state.lastError = "Earbuds not connected"
@@ -406,8 +416,8 @@ struct DeviceControllerTests {
 
     @Test("a set clears the loader rather than making the user wait it out")
     func settingAModeClearsResolving() async throws {
-        let (controller, _, _) = makeController(mode: .normal)
-        controller.settleReads = [.seconds(45)]
+        let (controller, _, backend, _) = makeController(mode: .normal)
+        backend.policy.settleReads = [.seconds(45)]
         await controller.connectionChanged(.ready)
         #expect(controller.state.isResolvingMode)
 
@@ -418,13 +428,73 @@ struct DeviceControllerTests {
 
     @Test("losing the earbuds clears the loader")
     func disconnectClearsResolving() async throws {
-        let (controller, _, _) = makeController(mode: .normal)
-        controller.settleReads = [.seconds(45)]
+        let (controller, _, backend, _) = makeController(mode: .normal)
+        backend.policy.settleReads = [.seconds(45)]
         await controller.connectionChanged(.ready)
         #expect(controller.state.isResolvingMode)
 
         await controller.connectionChanged(.waiting)
         #expect(controller.state.isResolvingMode == false)
+        controller.stop()
+    }
+
+    @Test("a pushing device holds the loader until its pushed mode arrives")
+    func pushingDeviceClearsResolvingOnlyOnMode() async throws {
+        let (controller, transport, backend, _) = makeController()
+        backend.policy.settleReads = []
+        // A fresh connection: nothing has been read off this device yet.
+        controller.state.mode = nil
+        // A pushing backend answers nothing on connect — `SamsungBackend.refresh()`
+        // is deliberately a no-op, and the state arrives later, unprompted. The
+        // GAIA fake would answer `refresh()` immediately, so silence it: what is
+        // under test is that the *push*, not the connect, clears the loader.
+        transport.failWrites = true
+        await controller.connectionChanged(.ready)
+        #expect(controller.state.isResolvingMode,
+                "no mode has arrived yet — the picker must stay blocked")
+
+        transport.emitModeChange(.anc)
+        try await until("loader cleared by the pushed mode") {
+            controller.state.isResolvingMode == false
+        }
+        #expect(controller.state.mode == .anc)
+        controller.stop()
+    }
+
+    /// The byte-12 misparse case. `SppEvents` justifies shipping an unverified
+    /// offset on the promise that a failed guard emits no `.mode` and leaves the
+    /// UI reading "Reading mode…" rather than showing a confident wrong mode;
+    /// the panel renders a nil mode as "Off" with the picker enabled, so this is
+    /// the only thing keeping that promise true.
+    @Test("a pushing device that never reports a mode keeps the loader up")
+    func pushingDeviceWithoutModeStaysResolving() async throws {
+        let (controller, transport, backend, _) = makeController()
+        backend.policy.settleReads = []
+        controller.state.mode = nil
+        transport.failWrites = true
+        await controller.connectionChanged(.ready)
+        // Long enough for any deferred clear to have run: nothing may lower this
+        // flag but a mode event, and none is coming.
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(controller.state.isResolvingMode)
+        #expect(controller.state.displayMode == nil,
+                "and the panel must have nothing it could show as a settled mode")
+        controller.stop()
+    }
+
+    @Test("switching device family clears readings from the previous device")
+    func useClearsPreviousDevice() async throws {
+        let (controller, _, _, _) = makeController(mode: .anc)
+        controller.state.batteryLeft = 80
+        controller.state.firmware = "old"
+
+        let other = GaiaBackend(transport: FakeTransport(mode: .normal))
+        other.policy = BackendPolicy()
+        controller.use(other)
+
+        #expect(controller.state.mode == nil, "a mode from other earbuds is not news about these")
+        #expect(controller.state.batteryLeft == nil)
+        #expect(controller.state.firmware == nil)
         controller.stop()
     }
 

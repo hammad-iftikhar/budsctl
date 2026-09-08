@@ -13,19 +13,32 @@ extension KeyboardShortcuts.Name {
 @Observable
 final class AppModel {
     let bridge: StateBridge
-    let client: GaiaClient
     let controller: DeviceController
+
+    private let backends: [any EarbudsBackend]
+    /// Discovery results per backend, merged for the UI. Kept per backend so a
+    /// quiet backend cannot blank out a noisy one's results.
+    private var discovered: [String: [DiscoveredDevice]] = [:]
 
     var devices: [DiscoveredDevice] = []
     var isScanning = false
 
+    /// The device the user selected, whichever backend owns it.
+    var selectedRef: DeviceRef? { bridge.deviceRef }
+
     init() {
         let bridge = StateBridge.shared
-        let client = GaiaClient(bridge: bridge)
+        let backends = Backends.all()
         self.bridge = bridge
-        self.client = client
+        self.backends = backends
+
+        // Adopt the saved device's backend, or the first one as a placeholder
+        // so the controller always has something to talk to.
+        let saved = bridge.deviceRef
+        let active = backends.first { type(of: $0).id == saved?.backend } ?? backends[0]
+
         self.controller = DeviceController(
-            transport: client,
+            backend: active,
             bridge: bridge,
             onStateChanged: {
                 // Keep Control Center's cached value honest. macOS hosts exactly
@@ -35,16 +48,30 @@ final class AppModel {
             }
         )
 
-        client.onConnectionChange = { [weak self] state in
-            guard let self else { return }
-            Task { await self.controller.connectionChanged(state) }
+        for backend in backends {
+            let backendID = type(of: backend).id
+            // Only the adopted backend may move the connection state. A
+            // backend nobody selected reporting `.notConfigured` would
+            // otherwise overwrite the live one's `.ready`.
+            backend.onConnectionChange = { [weak self] state in
+                guard let self, type(of: self.activeBackend).id == backendID else { return }
+                Task { await self.controller.connectionChanged(state) }
+            }
+            backend.onDiscoveryUpdate = { [weak self] devices in
+                self?.discovered[backendID] = devices
+                self?.mergeDiscovered()
+            }
+            backend.start()
         }
-        client.onDiscoveryUpdate = { [weak self] devices in
-            self?.devices = devices
+
+        if let saved {
+            active.adopt(saved)
+        } else {
+            // Nothing saved: say so rather than leaving the panel blank.
+            Task { await controller.connectionChanged(.notConfigured) }
         }
 
         controller.start()
-        client.start()
 
         // Control Center and Shortcuts post requests here. Darwin
         // notifications coalesce, so always drain rather than assuming one
@@ -104,34 +131,156 @@ final class AppModel {
         }
     }
 
+
+    /// The backend the controller is currently driven by.
+    private var activeBackend: any EarbudsBackend {
+        backends.first { type(of: $0).id == (bridge.deviceRef?.backend ?? "") } ?? backends[0]
+    }
+
+    /// Tie-broken on the ref, not just the name: Swift's sort is not stable, so
+    /// two identically-named devices — a plausible pair of the same model —
+    /// would otherwise swap rows every time discovery updates.
+    private func mergeDiscovered() {
+        devices = discovered.values.flatMap { $0 }.sorted {
+            ($0.name, $0.id.persistedForm) < ($1.name, $1.id.persistedForm)
+        }
+    }
+
+    /// Name of the selected device, for the panel header.
+    ///
+    /// Read out of the merged discovery list rather than asked of a backend:
+    /// `GaiaClient.deviceName` was one radio's property and there are two
+    /// radios now.
+    ///
+    /// ponytail: nil until a discovery pass has seen the device, so the header
+    /// falls back to a generic label for the first moment after launch. The
+    /// upgrade path is storing the name next to the `DeviceRef` in
+    /// `StateBridge`, which is a persisted-format change and not worth one
+    /// label.
+    var deviceName: String? {
+        guard let selectedRef else { return nil }
+        return devices.first { $0.id == selectedRef }?.name
+    }
+
     func drainRequests() {
         while let request = bridge.takeRequest() {
             controller.handle(request)
         }
     }
 
-    /// Cheap: a retrieve, not a scan. Safe to call every time settings opens.
+    /// Cheap: a paired-device list and a retrieve, not a scan. Safe to call
+    /// every time Settings opens.
     func refreshDevices() {
-        devices = client.connectedDevices()
+        // A scan's results must not be replaced by the narrower connected-device
+        // list while the scan is still running: this overwrites `discovered`
+        // wholesale, so mid-scan it would drop every device found by scanning
+        // and leave the user watching a list that keeps emptying itself. Two
+        // call sites reach here on every connection transition — Settings and
+        // the panel — so this is not hypothetical.
+        guard !isScanning else { return }
+        for backend in backends {
+            discovered[type(of: backend).id] = backend.connectedDevices()
+        }
+        mergeDiscovered()
     }
 
     func startScan() {
         isScanning = true
-        client.startScan()
+        for backend in backends { backend.startScan() }
     }
 
     func stopScan() {
         isScanning = false
-        client.stopScan()
+        for backend in backends { backend.stopScan() }
     }
 
     func select(_ device: DiscoveredDevice) {
         isScanning = false
-        client.select(device)
+        for backend in backends { backend.stopScan() }
+
+        guard let target = backends.first(where: { type(of: $0).id == device.id.backend })
+        else { return }
+
+        // Re-start the backend we are about to hand the controller. A previous
+        // `select` or a `forget` may have called `disconnect()` on it, and for
+        // `GaiaBackend` that tears down the frame pump feeding its event hub —
+        // which nothing else rebuilds, so switching away from a family and back
+        // would leave it connected but silent. Both `start()` implementations
+        // are idempotent, so calling it every time is cheaper than tracking
+        // which backends are currently down. This is also what keeps Task 6's
+        // contract true: `controller.use(_:)` calls its own `start()`, never
+        // the backend's, so the backend must already be started when it
+        // arrives.
+        target.start()
+
+        // Computed BEFORE the save, and the order is load-bearing:
+        // `activeBackend` derives from `bridge.deviceRef`, so saving first would
+        // make this comparison always false and the controller would never be
+        // switched to the new family.
+        let switchingFamily = type(of: activeBackend).id != device.id.backend
+        bridge.saveDeviceRef(device.id)
+
+        // Release whatever held a link before, so a de-selected device's
+        // notifications can no longer reach the controller. `DeviceController.use`
+        // deliberately does *not* do this — the caller owns it, because only the
+        // caller knows which other backends exist.
+        //
+        // **This loop is an invariant `SamsungBackend` depends on, not just
+        // tidiness.** Its `openLink()` re-drives itself when it notices a
+        // different device was adopted while it was suspended over an SDP
+        // query. That re-drive is safe against the user switching to the *other
+        // backend* only because `disconnect()` nils that backend's `adopted`,
+        // which makes the re-drive condition false. Skip this loop and a
+        // de-selected Samsung backend would keep trying to reconnect the wrong
+        // earbuds underneath the one the user actually picked.
+        //
+        // Placed *after* the save and *before* `use`/`adopt`, and both halves
+        // of that matter. After the save, because the `onConnectionChange`
+        // guard tests `activeBackend` — a backend torn down before the save
+        // still passes it, and anything it reported would land through an
+        // unstructured `Task` after `use()`/`adopt()` had already run. Before
+        // `use`/`adopt`, because the new backend must not be adopted while the
+        // old one still holds its link. Latent today — neither `disconnect()`
+        // reports a state — so this closes the hole rather than fixing a bug.
+        for backend in backends where type(of: backend).id != device.id.backend {
+            backend.disconnect()
+        }
+
+        if switchingFamily { controller.use(target) }
+        // `adopt` reports `.connecting`, which is what repaints the UI after a
+        // switch — `disconnect()` above reports nothing, by design.
+        target.adopt(device.id)
     }
 
     func forget() {
-        client.forgetDevice()
+        for backend in backends { backend.disconnect() }
+
+        // Restores the invariant that `controller`'s backend is always the one
+        // `activeBackend` names. Without it, forgetting a Samsung device leaves
+        // the controller streaming `SamsungBackend.events()` while
+        // `activeBackend` has already fallen back to `backends[0]` — so the next
+        // selection of a GAIA device computes `switchingFamily == false`, skips
+        // `use(_:)`, and leaves the controller wired to a dead backend behind a
+        // green panel.
+        //
+        // ponytail: the sturdier shape is a stored `activeBackendID`, updated
+        // wherever `use(_:)` is called and read by both `switchingFamily` and
+        // the `onConnectionChange` guard, instead of re-deriving the active
+        // backend from `bridge.deviceRef` on every access. That removes the
+        // class of bug rather than this instance of it, but it is a wider
+        // change than this restores.
+        //
+        // Started before it is handed over, so contract 1 holds literally and
+        // not merely by coincidence: the disconnect loop above cancelled this
+        // backend's frame pump, and `use(_:)` calls the *controller's*
+        // `start()`, never the backend's. Nothing observes the difference today
+        // — nothing is adopted after a forget — but an invariant that depends on
+        // no one looking is one refactor from being false.
+        backends[0].start()
+        controller.use(backends[0])
+
+        bridge.saveDeviceRef(nil)
+        Task { await controller.connectionChanged(.notConfigured) }
     }
 }
 

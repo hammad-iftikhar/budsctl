@@ -16,7 +16,7 @@ struct SettingsView: View {
     // next view update, not synchronously after the write.
     @State private var isSyncingToggle = false
 
-    private var selected: UUID? { model.bridge.peripheralIdentifier }
+    private var selected: DeviceRef? { model.selectedRef }
 
     /// The connected list is shown in full — the service-UUID lookup already
     /// narrows it to a handful of LE audio peripherals, so filtering it further
@@ -44,6 +44,11 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            // One flat list, deliberately not grouped by vendor. `model.devices`
+            // is already sorted (and tie-broken on the ref, so same-named pairs
+            // cannot swap rows between updates), and `visible` preserves that
+            // order. Two headers over a list that is usually one or two rows
+            // was noise: what the user picks is a pair of earbuds, not a brand.
             ForEach(visible) { device in
                 Button {
                     model.select(device)

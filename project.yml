@@ -13,8 +13,8 @@ settings:
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
-    MARKETING_VERSION: "1.2"
-    CURRENT_PROJECT_VERSION: "3"
+    MARKETING_VERSION: "2.0"
+    CURRENT_PROJECT_VERSION: "4"
     ENABLE_HARDENED_RUNTIME: YES
     DEAD_CODE_STRIPPING: YES
 
@@ -48,6 +48,10 @@ targets:
       # .framework dependency found"), so the app bundle ships no
       # Metadata.appintents and only the appex carries the actions.
       - sdk: AppIntents.framework
+      # Galaxy Buds speak Bluetooth Classic RFCOMM, which CoreBluetooth cannot
+      # reach. Ships in the SDK, so Package.swift needs no change — only the
+      # app target has to link it.
+      - sdk: IOBluetooth.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.hammadiftikhar.budsctl
