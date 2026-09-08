@@ -21,6 +21,8 @@ public final class StateBridge: @unchecked Sendable {
         /// Payload *and* seq together — see `StoredRequest`.
         static let request = "request"
         static let handledSeq = "handledSeq"
+        /// Holds a `DeviceRef.persistedForm`. Named for what v1.2 stored here
+        /// (a bare peripheral UUID); kept so upgrades do not lose the device.
         static let peripheralIdentifier = "peripheralIdentifier"
     }
 
@@ -173,16 +175,24 @@ public final class StateBridge: @unchecked Sendable {
         DarwinNotifications.shared.observe(BudsCtl.requestNotification, handler)
     }
 
-    // MARK: - Saved peripheral
+    // MARK: - Saved device
 
-    public var peripheralIdentifier: UUID? {
-        guard let raw = defaults.string(forKey: Key.peripheralIdentifier) else { return nil }
-        return UUID(uuidString: raw)
+    /// The device the user selected, or nil if none.
+    ///
+    /// Stored under the original `peripheralIdentifier` key rather than a
+    /// renamed one. Renaming it would forget every existing user's device for
+    /// no gain — the key is private to this type, and `DeviceRef(persisted:)`
+    /// already understands both the old and the new value shape.
+    public var deviceRef: DeviceRef? {
+        guard let raw = defaults.string(forKey: Key.peripheralIdentifier),
+              !raw.isEmpty
+        else { return nil }
+        return DeviceRef(persisted: raw)
     }
 
-    public func savePeripheralIdentifier(_ id: UUID?) {
-        if let id {
-            defaults.set(id.uuidString, forKey: Key.peripheralIdentifier)
+    public func saveDeviceRef(_ ref: DeviceRef?) {
+        if let ref {
+            defaults.set(ref.persistedForm, forKey: Key.peripheralIdentifier)
         } else {
             defaults.removeObject(forKey: Key.peripheralIdentifier)
         }

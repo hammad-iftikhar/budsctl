@@ -4,7 +4,7 @@
 
 # BudsCtl
 
-### Noise-cancellation control for SoundPEATS earbuds on macOS. AirPods menu bar experience, for buds that never got one.
+### Noise-cancellation control for your earbuds on macOS. AirPods menu bar experience, for buds that never got one.
 
 MacOS gives AirPods a proper noise-mode control in the menu bar. Everyone else gets
 the touch gesture on the bud: tap and hold, guess which mode you landed on, try again.
@@ -23,10 +23,24 @@ Center, in Shortcuts, and on a global hotkey with battery for each bud.
 
 ---
 
-> **Tested with SoundPEATS Air4 Pro only.** That is the one device I own. The earbuds
-> speak Qualcomm's GAIA V2 protocol, which many SoundPEATS models share, so others may
-> work as-is but nothing else has been verified. If you try one, please
-> [open an issue](../../issues) either way.
+## Supported earbuds
+
+| | Verified | Should work | How |
+| --- | --- | --- | --- |
+| **SoundPEATS** | Air4 Pro | other SoundPEATS models | Qualcomm GAIA V2 over Bluetooth LE |
+| **Samsung Galaxy Buds** | none | Buds FE, Buds Pro, Buds2, Buds2 Pro, Buds3, Buds3 Pro, Buds3 FE, Buds Core, Buds4, Buds4 Pro | Samsung SPP over Bluetooth Classic RFCOMM |
+
+> **Verified means confirmed against real hardware — one device, the Air4 Pro.**
+> Everything in the "should work" column shares a protocol with a verified device
+> and is expected to work, but nothing else has been tested, and that includes
+> every Galaxy Buds model: the Samsung side of this app has never been run
+> against a real earbud. It is implemented from a reverse-engineered protocol
+> reference and covered by unit tests over synthetic bytes, nothing more. If you
+> try one, please [open an issue](../../issues) either way.
+>
+> **Not supported:** the original Galaxy Buds (2019) use different framing, and
+> Buds+ and Buds Live use an older ambient-sound model rather than the
+> three-way noise control this app is built around.
 
 ## Features
 
@@ -59,7 +73,7 @@ Center, in Shortcuts, and on a global hotkey with battery for each bud.
 
 1. Pair your earbuds with the Mac in **System Settings ▸ Bluetooth**, as usual. BudsCtl controls buds macOS is already connected to; it doesn't replace pairing.
 2. Click the menu bar icon, open **Settings** at the bottom of the panel, and pick your earbuds from the list. Connected devices appear without any scan. If yours doesn't, take a bud out of the case and hit **Scan for More**.
-3. Grant **Bluetooth** access when macOS asks. Without it CoreBluetooth is denied.
+3. Grant **Bluetooth** access when macOS asks. Without it the app can't see any earbuds.
 4. Turn on **Launch at login** so the menu bar control is simply always there.
 
 ## Four ways to switch
@@ -78,6 +92,15 @@ Control Center and Shortcuts work even when the app isn't running, the request i
 There is no public API for this. The earbuds speak **GAIA V2** Qualcomm's control protocol over Bluetooth LE, so the protocol here was reverse engineered from the traffic to a device I own: read the mode, set the mode, read each battery, read the firmware version. BudsCtl holds one BLE connection, keeps a small snapshot of what the buds reported, and hands that snapshot to Control Center and Shortcuts so they never have to open a connection of their own.
 
 The awkward part isn't sending commands, it's *trusting* what comes back. The buds don't answer reliably in the first moments after connecting, and they don't announce it when they later settle into their saved mode. So BudsCtl re-reads a few times over the first minute and says **"Reading mode…"** rather than showing you a guess.
+
+Galaxy Buds work differently enough to be worth a sentence. They speak a Samsung
+protocol over Bluetooth **Classic** RFCOMM rather than Bluetooth LE, so they go
+through IOBluetooth instead of CoreBluetooth — and unlike the SoundPEATS buds,
+they volunteer their full state the moment the connection opens and announce
+every mode change, including ones you make by touch or from your phone. So there
+is no "Reading mode…" guesswork for them: the protocol reverse-engineered by
+[GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient) does the work,
+and this app just listens.
 
 ---
 
@@ -122,8 +145,9 @@ Apple ID is enough to build and run it yourself; see [Install](#install) for wha
 ### Test
 
 ```sh
-swift test                       # 76 tests, no hardware needed
+swift test                       # 132 tests, no hardware needed
 swift run budsctl-cli status     # against real hardware
+swift run budsctl-cli samsung <mac>  # verify the Galaxy Buds SPP protocol against real hardware
 ```
 
 The BLE layer was proven with the CLI before any UI existed, and it's still the fastest way to see what the buds are doing:
@@ -147,17 +171,21 @@ development-signed rather than notarized.
 
 ### Limitations
 
-- **One device family, verified:** Only SoundPEATS Air4 Pro on firmware v0.2.1 has been tested. Other GAIA devices may work; expect nothing.
+- **One device, verified:** Only SoundPEATS Air4 Pro on firmware v0.2.1 has been tested against real hardware. Other GAIA devices may work; expect nothing. The Galaxy Buds side has not been run against any real earbud at all — see [Supported earbuds](#supported-earbuds).
 - **Not notarized:** Gatekeeper blocks the released DMG. See the install note.
 - **macOS 26+ and Apple Silicon:** The project targets macOS 26 with Swift 6 strict concurrency. There's no back-deployment.
 - **One Control Center control:** For the SDK reason above cycle, not three buttons.
-- **Reverse engineered, not documented:** GAIA V2 is Qualcomm's, undocumented publicly, and derived here from traffic to my own device. A firmware update could change it.
+- **Reverse engineered, not documented:** GAIA V2 is Qualcomm's, undocumented publicly, and derived here from traffic to my own device. A firmware update could change it. The Samsung SPP side is reverse engineered too, but from a third-party protocol reference rather than a packet capture of a device I own — see [Supported earbuds](#supported-earbuds).
 
 ## Credits & license
 
 Global hotkey handling uses [KeyboardShortcuts](https://github.com/sindresorhus/KeyboardShortcuts)
 by Sindre Sorhus (MIT).
 
-BudsCtl is not affiliated with, endorsed by, or supported by SoundPEATS or Qualcomm.
-GAIA is Qualcomm's protocol; the implementation here was written for interoperability
-with a device the author owns.
+The Samsung SPP protocol implementation was written against the reference kept by
+[GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient).
+
+BudsCtl is not affiliated with, endorsed by, or supported by SoundPEATS, Qualcomm,
+or Samsung. GAIA is Qualcomm's protocol and SPP is Samsung's; the implementations
+here were written for interoperability, the GAIA one with a device the author owns
+and the Samsung one from a reverse-engineered protocol reference only.
