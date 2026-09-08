@@ -220,14 +220,29 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         )
     }
 
-    /// Fires when any paired device forms a baseband connection.
-    @objc private func deviceConnected(
+    /// Delivered on IOBluetooth's own queue, **not** the main run loop.
+    ///
+    /// `register(forConnectNotifications:selector:)` takes no queue parameter
+    /// and calls back on `com.apple.bluetooth.iobluetooth.coordinatorQueue`.
+    /// That is the difference from `GaiaClient`, which constructs its
+    /// `CBCentralManager` with `queue: .main` and so can be `@MainActor`
+    /// throughout. An `@MainActor` body here traps under Swift 6 isolation
+    /// checking before its first line — including before its `guard` — so the
+    /// crash happens whenever any classic-Bluetooth accessory is already
+    /// connected when `start()` runs.
+    ///
+    /// Hence `nonisolated`: take the one `Sendable` value needed, then hop.
+    /// `IOBluetoothDevice` is not `Sendable` and must not cross.
+    @objc nonisolated private func deviceConnected(
         _ notification: IOBluetoothUserNotification,
         device: IOBluetoothDevice
     ) {
-        guard let adopted, device.addressString == adopted.id else { return }
-        openAttempt = 0
-        Task { await openLink() }
+        let address = device.addressString
+        Task { @MainActor [weak self] in
+            guard let self, let adopted = self.adopted, address == adopted.id else { return }
+            self.openAttempt = 0
+            await self.openLink()
+        }
     }
 
     private func openLink() async {
@@ -522,60 +537,98 @@ public enum SamsungError: Error, Equatable {
 ///
 /// There is no `rfcommChannelWriteComplete`: `send` is synchronous, so nothing
 /// is waiting to hear about a write.
-extension SamsungBackend: @MainActor IOBluetoothRFCOMMChannelDelegate {
+///
+/// **None of these three, nor `sdpQueryComplete:status:` below, are documented
+/// to arrive on the main run loop.** Neither `IOBluetoothRFCOMMChannel.h` nor
+/// `IOBluetoothDevice.h` says which thread or queue calls back — the same
+/// silence `register(forConnectNotifications:selector:)` left, and that one
+/// turned out to call back on `com.apple.bluetooth.iobluetooth.coordinatorQueue`
+/// (see `deviceConnected` above). Absent a documented guarantee, and with one
+/// sibling API in this same header already proven to violate the assumption,
+/// all four are treated as arriving off-main: `nonisolated`, extract what's
+/// `Sendable`, hop. `IOBluetoothRFCOMMChannel` and `IOBluetoothDevice` are not
+/// `Sendable` and must not cross — the identity check that used to compare the
+/// delegate call's channel against `self.channel` now compares
+/// `ObjectIdentifier`s (a `Sendable` value) instead of the channel references
+/// themselves, and every actual channel operation runs against `self.channel`
+/// on the main actor, never against the parameter that arrived with the call.
+extension SamsungBackend: IOBluetoothRFCOMMChannelDelegate {
 
-    public func rfcommChannelOpenComplete(
+    public nonisolated func rfcommChannelOpenComplete(
         _ rfcommChannel: IOBluetoothRFCOMMChannel!,
         status error: IOReturn
     ) {
-        guard let rfcommChannel, rfcommChannel === channel else { return }
-        guard error == kIOReturnSuccess, rfcommChannel.isOpen() else {
-            // Closed and un-delegated before it is dropped: nilling the
-            // reference alone leaves a failed channel holding `self` as its
-            // delegate for the life of the process.
-            rfcommChannel.setDelegate(nil)
-            rfcommChannel.close()
-            channel = nil
-            scheduleOpenRetry()
-            return
+        guard let rfcommChannel else { return }
+        let identifier = ObjectIdentifier(rfcommChannel)
+        let succeeded = error == kIOReturnSuccess
+        Task { @MainActor [weak self] in
+            guard let self, let channel = self.channel, ObjectIdentifier(channel) == identifier else { return }
+            guard succeeded, channel.isOpen() else {
+                // Closed and un-delegated before it is dropped: nilling the
+                // reference alone leaves a failed channel holding `self` as its
+                // delegate for the life of the process.
+                channel.setDelegate(nil)
+                channel.close()
+                self.channel = nil
+                self.scheduleOpenRetry()
+                return
+            }
+            self.openAttempt = 0
+            self.report(.ready)
+            // Announce ourselves, the way the reference implementation does on
+            // connect. The buds push EXTENDED_STATUS_UPDATED without being asked,
+            // so nothing here requests state.
+            try? self.send(.managerInfo, [0x01, 0x02, 0x22])
         }
-        openAttempt = 0
-        report(.ready)
-        // Announce ourselves, the way the reference implementation does on
-        // connect. The buds push EXTENDED_STATUS_UPDATED without being asked,
-        // so nothing here requests state.
-        try? send(.managerInfo, [0x01, 0x02, 0x22])
     }
 
-    public func rfcommChannelData(
+    public nonisolated func rfcommChannelData(
         _ rfcommChannel: IOBluetoothRFCOMMChannel!,
         data dataPointer: UnsafeMutableRawPointer!,
         length dataLength: Int
     ) {
-        guard let rfcommChannel, rfcommChannel === channel else { return }
-        guard let dataPointer, dataLength > 0 else { return }
+        guard let rfcommChannel, let dataPointer, dataLength > 0 else { return }
+        let identifier = ObjectIdentifier(rfcommChannel)
+        // Copied into a `Sendable` buffer before the hop — the raw pointer is
+        // only valid for the duration of this callback.
         let chunk = Data(bytes: dataPointer, count: dataLength)
-        for frame in reassembler.append(chunk) {
-            frameHub.yield(frame)
-            for event in frame.events { hub.yield(event) }
+        Task { @MainActor [weak self] in
+            guard let self, let channel = self.channel, ObjectIdentifier(channel) == identifier else { return }
+            for frame in self.reassembler.append(chunk) {
+                self.frameHub.yield(frame)
+                for event in frame.events { self.hub.yield(event) }
+            }
         }
     }
 
-    public func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
-        guard let rfcommChannel, rfcommChannel === channel else { return }
-        closeChannel()
-        // Wait for the next connect notification rather than spinning. The buds
-        // are usually back in the case.
-        report(.waiting)
+    public nonisolated func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+        guard let rfcommChannel else { return }
+        let identifier = ObjectIdentifier(rfcommChannel)
+        Task { @MainActor [weak self] in
+            guard let self, let channel = self.channel, ObjectIdentifier(channel) == identifier else { return }
+            self.closeChannel()
+            // Wait for the next connect notification rather than spinning. The buds
+            // are usually back in the case.
+            self.report(.waiting)
+        }
     }
 }
 
 extension SamsungBackend {
     /// SDP query completion. Declared `@objc` because `performSDPQuery(_:)`
     /// takes an untyped target and calls this by selector.
-    @objc(sdpQueryComplete:status:)
+    ///
+    /// `nonisolated` for the same reason as the RFCOMM delegate methods above:
+    /// no documented run-loop guarantee. `device` is unused and dropped rather
+    /// than crossing the hop — only `status`, an `IOReturn` (`Int32`, already
+    /// `Sendable`), is needed.
+    @objc(sdpQueryComplete:status:) nonisolated
     func sdpQueryComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
-        resumeSDPQuery(status == kIOReturnSuccess, generation: sdpGeneration)
+        let succeeded = status == kIOReturnSuccess
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.resumeSDPQuery(succeeded, generation: self.sdpGeneration)
+        }
     }
 }
 
