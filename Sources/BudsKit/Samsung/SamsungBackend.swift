@@ -144,35 +144,58 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     }
 
     private func closeChannel() {
+        // Above the `channel == nil` guard, deliberately: the pump and route
+        // must come down whenever this is called, not only when there is a
+        // channel to close. Nothing takes that path today, but the moment
+        // some future caller nils `channel` without going through here, a
+        // guarded teardown would leak the pump task and leave a stale route
+        // behind it.
+        dataPump?.cancel()
+        dataPump = nil
+        // `finish()`, not just clearing the route: cancelling `dataPump` stops
+        // the *consumer*, but termination should not rest on cancellation
+        // alone — a stream nobody ever finishes is a suspended `for await`
+        // with no way to wake on its own. `finish()` after a `yield` (or with
+        // no consumer at all) is a documented no-op, so this is safe to call
+        // unconditionally.
+        dataRoute.value?.continuation.finish()
+        dataRoute.value = nil
         guard let channel else { return }
         channel.setDelegate(nil)
         channel.close()
         self.channel = nil
-        // Both cleared: `dataRoute.value = nil` alone already stops
-        // `rfcommChannelData` yielding into this channel's continuation, but
-        // dropping the pump too means neither one keeps a reference to a
-        // channel this backend has already left.
-        dataPump?.cancel()
-        dataPump = nil
-        dataRoute.value = nil
         reassembler = SppReassembler()
         // Nothing else to unwind: `send` is synchronous, so there is never a
         // write in flight across a suspension for this to have to fail.
     }
 
-    /// Starts consuming the just-opened channel's bytes.
+    /// Starts consuming a just-opened channel's bytes.
     ///
-    /// A fresh `AsyncStream`/`Continuation` pair, not the one shared stream a
-    /// first draft of this fix reused across every channel this backend ever
-    /// opens: `AsyncStream` terminates for good the moment the task consuming
-    /// it is cancelled — documented on `Continuation.onTermination`, "invoked
-    /// ... if the task calling `next()` is cancelled" — and a second consumer
-    /// attached afterward gets nothing back, not even values already yielded
-    /// and buffered. Reusing one stream across a reconnect would silently
-    /// drop every chunk from the second connection onward; confirmed with a
-    /// standalone repro before writing this rather than assumed. A fresh pair
-    /// per channel sidesteps the whole hazard: nothing is ever asked to
-    /// out-live the one consumer it was made for.
+    /// **Called from `openLink()`, immediately after `channel = opened` — not
+    /// from `rfcommChannelOpenComplete`, even though that is where the
+    /// equivalent per-chunk `Task` used to live.** IOBluetooth serializes
+    /// callbacks on its own queue, so `rfcommChannelData` can fire — and
+    /// deliver the very first bytes, `EXTENDED_STATUS_UPDATED` among them —
+    /// while the `Task { @MainActor }` hop out of `rfcommChannelOpenComplete`
+    /// is still enqueued and has not yet run. A route that only exists once
+    /// that hop lands would drop every chunk that arrives in that window,
+    /// silently: `rfcommChannelData`'s identity guard fails, not fatally, so
+    /// there is nothing to see except a reassembler that never hears about
+    /// the frame this whole feature exists to read. Calling this here means
+    /// the route exists from the same instant `self.channel` does, before
+    /// IOBluetooth has any path to deliver a single byte.
+    ///
+    /// A fresh `AsyncStream`/`Continuation` pair per call, not one shared
+    /// stream for this object's whole lifetime: `AsyncStream` terminates for
+    /// good the moment the task consuming it is cancelled — documented on
+    /// `Continuation.onTermination`, "invoked ... if the task calling
+    /// `next()` is cancelled" — and a second consumer attached afterward gets
+    /// nothing back, not even values already yielded and buffered. Reusing
+    /// one stream across a reconnect would silently drop every chunk from the
+    /// second connection onward; confirmed with a standalone repro before
+    /// writing this rather than assumed. A fresh pair per channel sidesteps
+    /// the whole hazard: nothing is ever asked to out-live the one consumer
+    /// it was made for.
     private func startDataPump(for channel: IOBluetoothRFCOMMChannel) {
         dataPump?.cancel()
         let (chunks, continuation) = AsyncStream<Data>.makeStream()
@@ -402,6 +425,9 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
             return
         }
         channel = opened
+        // Here, not in `rfcommChannelOpenComplete` — see `startDataPump(for:)`
+        // for why the placement is load-bearing rather than cosmetic.
+        startDataPump(for: opened)
     }
 
     private func performSDPQuery(_ device: IOBluetoothDevice) async -> Bool {
@@ -622,17 +648,16 @@ extension SamsungBackend: IOBluetoothRFCOMMChannelDelegate {
         Task { @MainActor [weak self] in
             guard let self, let channel = self.channel, ObjectIdentifier(channel) == identifier else { return }
             guard succeeded, channel.isOpen() else {
-                // Closed and un-delegated before it is dropped: nilling the
-                // reference alone leaves a failed channel holding `self` as its
-                // delegate for the life of the process.
-                channel.setDelegate(nil)
-                channel.close()
-                self.channel = nil
+                // `closeChannel()`, not a hand-rolled teardown: `startDataPump`
+                // now runs at channel-assignment time in `openLink()`, before
+                // this callback is even known to fire, so by the time a failed
+                // open reaches here the pump and route already exist and must
+                // come down too — `closeChannel()` is where that is done.
+                self.closeChannel()
                 self.scheduleOpenRetry()
                 return
             }
             self.openAttempt = 0
-            self.startDataPump(for: channel)
             self.report(.ready)
             // Announce ourselves, the way the reference implementation does on
             // connect. The buds push EXTENDED_STATUS_UPDATED without being asked,
@@ -653,6 +678,21 @@ extension SamsungBackend: IOBluetoothRFCOMMChannelDelegate {
         length dataLength: Int
     ) {
         guard let rfcommChannel, let dataPointer, dataLength > 0 else { return }
+        // `ObjectIdentifier`, not `===`, because the channel itself cannot
+        // cross this hop-free comparison — but that is weaker than identity
+        // in general: a deallocated object's address can be reused, which is
+        // why `sdpGeneration` exists to distinguish one SDP query's callback
+        // from a later one's. It does not apply here, though: `dataRoute` is
+        // only ever set in `startDataPump(for:)`, immediately after
+        // `self.channel` is assigned the same object, and only ever cleared
+        // in `closeChannel()`, in the same breath as releasing `self.channel`.
+        // So the identifier this route holds always names an object
+        // `self.channel` is *currently, strongly* holding — for it to name a
+        // dead object, that object would have to be deallocated while
+        // `self.channel` still referenced it, which cannot happen. A
+        // `channelGeneration` counter mirroring `sdpGeneration` was
+        // considered and rejected on this basis: it would guard against a
+        // hazard `ObjectIdentifier` cannot actually hit here.
         guard let target = dataRoute.value, target.identifier == ObjectIdentifier(rfcommChannel) else { return }
         // Copied into a `Sendable` buffer immediately — the raw pointer is
         // only valid for the duration of this callback.
