@@ -61,6 +61,12 @@ struct PanelView: View {
                 Text(state.connection.label)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    // `.failed(_)`'s label is a sentence, not a status word:
+                    // the RFCOMM open-exhaustion message tells the user how to
+                    // recover, and in a 280-wide panel it would otherwise be
+                    // truncated to a single line ending in an ellipsis, which
+                    // hides the instruction that is the whole point of it.
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

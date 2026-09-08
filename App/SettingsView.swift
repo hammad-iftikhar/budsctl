@@ -34,7 +34,7 @@ struct SettingsView: View {
     private var groups: [(vendor: String, devices: [DiscoveredDevice])] {
         Dictionary(grouping: visible) { $0.id.backend }
             .map { group in
-                (vendor: Self.vendorName(group.key),
+                (vendor: model.vendorName(group.key),
                  // Tie-broken on the ref for the same reason `mergeDiscovered`
                  // is: Swift's sort is not stable, so two same-model pairs
                  // would otherwise swap rows between updates.
@@ -43,14 +43,6 @@ struct SettingsView: View {
                  })
             }
             .sorted { $0.vendor < $1.vendor }
-    }
-
-    private static func vendorName(_ backendID: String) -> String {
-        switch backendID {
-        case GaiaBackend.id: GaiaBackend.displayName
-        case SamsungBackend.id: SamsungBackend.displayName
-        default: backendID
-        }
     }
 
     var body: some View {

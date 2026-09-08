@@ -484,9 +484,13 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
 
     private func scheduleOpenRetry() {
         guard openAttempt < Self.openRetries.count else {
-            // Give up and wait for the next connect notification rather than
-            // spinning on a device that will not serve SPP.
-            report(.waiting)
+            // Not `.waiting`: the recovery path that would justify waiting is a
+            // baseband connect notification, and it cannot fire — the buds are
+            // already baseband-connected, which is why an open was attempted at
+            // all. Waiting silently would strand the user on a label that reads
+            // like normal operation. Re-selecting the device in Settings drives
+            // `adopt()` again, which is why the message says so.
+            report(.failed("Could not open the earbuds' control channel. Put them back in the case, or select them again in Settings."))
             return
         }
         let delay = Self.openRetries[openAttempt]
@@ -545,7 +549,13 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     ///   unconfirmed set. That one is heavy: a lost set tears the channel down
     ///   and rebuilds it, SDP query included, inside the set timeout. It stays
     ///   acceptable only because Samsung acks its sets, so the reconcile is
-    ///   rare.
+    ///   rare. It also cannot complete as the reconcile it was meant to be:
+    ///   tearing the channel down reports `.connecting`, which reaches
+    ///   `DeviceController.connectionChanged`, which cancels the very
+    ///   `performSet` task awaiting this read. The outcome is benign — the set
+    ///   is cancelled before it can report a false failure, and the
+    ///   `EXTENDED_STATUS_UPDATED` pushed when the rebuilt channel opens is
+    ///   what actually settles the mode.
     ///
     /// ponytail: the blunt instrument. If a firmware ever answers message 97 as
     /// a request, send that instead and keep the channel up.

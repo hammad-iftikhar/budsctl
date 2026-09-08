@@ -140,6 +140,13 @@ public final class DeviceController {
         case .mode(let mode):
             state.mode = mode
             if state.pendingMode == mode { state.pendingMode = nil }
+            // Only for a backend that pushes its state unprompted: its first
+            // mode IS the trustworthy one, so it is what clears the loader.
+            // For GAIA the opposite holds — the read taken as the link comes up
+            // is the least trustworthy one we ever take (see `settleMode`), so
+            // its loader stays owned by the settle sequence and must not be
+            // cleared here.
+            if backend.policy.settleReads.isEmpty { clearResolving() }
             publish()
 
         case .batteryLeft(let percent):
@@ -289,7 +296,12 @@ public final class DeviceController {
     /// same class of bug as writing before the notify subscription lands.
     private func readMode(timeout: Duration) async -> ANCMode? {
         let stream = backend.events()
-        await backend.refreshMode()
+        // Not awaited: `refreshMode()` has its own internal timeout, and
+        // awaiting it before opening the window below serialised the two into a
+        // ~9 s worst case for a set that never confirms. The answer arrives on
+        // the event stream regardless of who is waiting, so start the read and
+        // watch for it concurrently.
+        Task { [backend] in await backend.refreshMode() }
         let raced: ANCMode?? = await withTimeout(timeout) { () -> ANCMode? in
             for await event in stream {
                 if case .mode(let mode) = event { return mode }
@@ -435,13 +447,15 @@ public final class DeviceController {
         // refresh takes up to ~12 s of awaits, and the buds can be back in
         // the case by the time it returns.
         guard state.connection.isReady else { return }
-        // A device that pushes its state on connect has nothing to settle, and
-        // must not be left showing the loader waiting for a re-read that will
-        // never be scheduled.
-        guard !backend.policy.settleReads.isEmpty else {
-            clearResolving()
-            return
-        }
+        // A device that pushes its state on connect has no settle sequence to
+        // run — but the loader must NOT clear here. `displayMode` is still nil
+        // at this point, and the panel renders a nil mode as `.normal` with the
+        // picker enabled: a confident "Off" for a device whose mode we have not
+        // read. That is exactly the failure the byte-12 guards in `SppEvents`
+        // exist to prevent, and the comment there promises this behaviour.
+        // The loader is cleared by `apply(.mode)` instead, when a real mode
+        // actually arrives.
+        guard !backend.policy.settleReads.isEmpty else { return }
         settleTask = Task { [weak self] in await self?.settleMode() }
     }
 }

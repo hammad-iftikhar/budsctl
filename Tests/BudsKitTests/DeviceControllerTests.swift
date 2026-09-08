@@ -438,12 +438,47 @@ struct DeviceControllerTests {
         controller.stop()
     }
 
-    @Test("a pushing device shows no loader, because there is nothing to settle")
-    func pushingDeviceClearsResolving() async throws {
-        let (controller, _, backend, _) = makeController()
+    @Test("a pushing device holds the loader until its pushed mode arrives")
+    func pushingDeviceClearsResolvingOnlyOnMode() async throws {
+        let (controller, transport, backend, _) = makeController()
         backend.policy.settleReads = []
+        // A fresh connection: nothing has been read off this device yet.
+        controller.state.mode = nil
+        // A pushing backend answers nothing on connect — `SamsungBackend.refresh()`
+        // is deliberately a no-op, and the state arrives later, unprompted. The
+        // GAIA fake would answer `refresh()` immediately, so silence it: what is
+        // under test is that the *push*, not the connect, clears the loader.
+        transport.failWrites = true
         await controller.connectionChanged(.ready)
-        try await until("loader cleared") { controller.state.isResolvingMode == false }
+        #expect(controller.state.isResolvingMode,
+                "no mode has arrived yet — the picker must stay blocked")
+
+        transport.emitModeChange(.anc)
+        try await until("loader cleared by the pushed mode") {
+            controller.state.isResolvingMode == false
+        }
+        #expect(controller.state.mode == .anc)
+        controller.stop()
+    }
+
+    /// The byte-12 misparse case. `SppEvents` justifies shipping an unverified
+    /// offset on the promise that a failed guard emits no `.mode` and leaves the
+    /// UI reading "Reading mode…" rather than showing a confident wrong mode;
+    /// the panel renders a nil mode as "Off" with the picker enabled, so this is
+    /// the only thing keeping that promise true.
+    @Test("a pushing device that never reports a mode keeps the loader up")
+    func pushingDeviceWithoutModeStaysResolving() async throws {
+        let (controller, transport, backend, _) = makeController()
+        backend.policy.settleReads = []
+        controller.state.mode = nil
+        transport.failWrites = true
+        await controller.connectionChanged(.ready)
+        // Long enough for any deferred clear to have run: nothing may lower this
+        // flag but a mode event, and none is coming.
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(controller.state.isResolvingMode)
+        #expect(controller.state.displayMode == nil,
+                "and the panel must have nothing it could show as a settled mode")
         controller.stop()
     }
 
