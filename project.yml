@@ -48,6 +48,10 @@ targets:
       # .framework dependency found"), so the app bundle ships no
       # Metadata.appintents and only the appex carries the actions.
       - sdk: AppIntents.framework
+      # Galaxy Buds speak Bluetooth Classic RFCOMM, which CoreBluetooth cannot
+      # reach. Ships in the SDK, so Package.swift needs no change — only the
+      # app target has to link it.
+      - sdk: IOBluetooth.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.hammadiftikhar.budsctl

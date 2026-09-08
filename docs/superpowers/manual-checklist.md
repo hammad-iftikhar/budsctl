@@ -253,3 +253,52 @@ architecture depends on the answer.
   signing or team status ever breaks this, do not expect to "enable" a
   fallback — none exists in the code. The sketch in the Task 8 section of the
   plan is a starting point for writing one, not a switch to flip.
+
+## Galaxy Buds
+
+Ten checks, in the order they are cheapest to run. Check 1 gates the rest.
+
+1. **Sandbox.** The signed, sandboxed app lists paired Galaxy Buds in Settings.
+   If `budsctl-cli samsung` lists them but the app does not,
+   `com.apple.security.device.bluetooth` is not covering IOBluetooth — the
+   fallback is dropping `com.apple.security.app-sandbox`, which is acceptable
+   for DMG distribution.
+2. Both brands appear in Settings, grouped by vendor, with the saved one
+   selected.
+3. Selecting the Galaxy Buds while the Air4 Pro is connected releases the BLE
+   link — check the Air4 Pro stops responding to mode changes.
+4. Selecting the Air4 Pro again releases the RFCOMM channel.
+5. Mode set from the menu bar lands on the buds. Mode set by a touch gesture or
+   the phone's Wearable app reaches the menu bar.
+6. Battery for both sides appears within seconds of connecting, with no polling
+   — Galaxy Buds push it.
+7. Buds into the case shows "Waiting for earbuds"; out of the case reconnects
+   with no user action. This is the `register(forConnectNotifications:)` path,
+   which has no queued-connect safety net behind it.
+8. Sleep and wake with the buds in your ears: the mode is still correct
+   afterwards. This is `refresh()` reopening the channel.
+9. The Control Center tile and all four Shortcuts intents work against Galaxy
+   Buds, with no behaviour change from the SoundPEATS case.
+10. An install upgraded from v1.2 keeps its selected Air4 Pro.
+
+### Two things unverified in the Samsung parser and the IOBluetooth glue
+
+- **Byte 12 of `EXTENDED_STATUS_UPDATED` — the noise mode at connect time.**
+  Every other protocol offset used here is assigned unconditionally across
+  models; this one was inferred from a model-branching parser in the
+  reference implementation rather than read off a packet capture against real
+  hardware. It ships behind three guards, so a misparse shows
+  "Reading mode…" rather than a confident lie — but if the mode shown right
+  after connecting is ever wrong, this byte is the first thing to check.
+  `budsctl-cli samsung <mac>` exists specifically to settle it: connect with
+  it, dump the raw `EXTENDED_STATUS_UPDATED` frame, and compare byte 12
+  against the mode the buds are actually in.
+- **Whether four of the five IOBluetooth `@objc` callbacks really arrive off
+  the main thread.** One — `deviceConnected` — provably does: it crashed the
+  CLI until it was hopped onto its own queue. The other four
+  (`rfcommChannelOpenComplete`, `rfcommChannelData`, `rfcommChannelClosed`,
+  `sdpQueryComplete`) were given the same treatment by analogy, because the
+  IOBluetooth headers document no delivery-thread guarantee for any of them,
+  but that is reasoned, not proven. If a future change reintroduces a
+  main-thread assumption here, a hang or a crash under real traffic (not the
+  synthetic-byte unit tests) is the symptom to watch for.

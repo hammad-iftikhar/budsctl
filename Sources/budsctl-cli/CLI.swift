@@ -13,7 +13,7 @@ import BudsKit
 @MainActor
 final class Runner {
     let bridge = StateBridge(defaults: .standard)
-    lazy var client = GaiaClient(bridge: bridge)
+    lazy var client = GaiaClient()
 
     // withTimeout races the operation against a sleep inside a task group, and
     // a task group drains all its children even after cancelAll() — cancelling
@@ -34,6 +34,10 @@ final class Runner {
         }
         defer { continuation.finish() }
         client.start()
+        guard let ref = bridge.deviceRef, ref.backend == "gaia" else {
+            throw CLIError.message("No device saved. Run `budsctl-cli discover` first.")
+        }
+        client.adopt(ref)
 
         let outcome = await withTimeout(timeout) { () -> Result<Void, CLIError> in
             for await state in states {
@@ -64,6 +68,7 @@ func usage() -> Never {
       set <mode>         normal | anc | passthrough
       watch              print every frame the device sends, until Ctrl-C
       symbols            check that the SF Symbols this app uses exist
+      samsung [mac]      list paired Galaxy Buds, or connect and dump frames
     """)
     exit(2)
 }
@@ -83,6 +88,7 @@ struct CLI {
                 try await set(arguments[1])
             case "watch": try await watch()
             case "symbols": symbols()
+            case "samsung": try await samsung(arguments.count > 1 ? arguments[1] : nil)
             default: usage()
             }
         } catch CLIError.message(let text) {
@@ -120,7 +126,8 @@ struct CLI {
         guard let line = readLine(), let index = Int(line), seen.indices.contains(index) else {
             throw CLIError.message("Not a valid choice.")
         }
-        runner.client.select(seen[index])
+        runner.bridge.saveDeviceRef(seen[index].id)
+        runner.client.adopt(seen[index].id)
         print("saved \(seen[index].name) as \(seen[index].id)")
     }
 
@@ -190,6 +197,50 @@ struct CLI {
         for name in Set(names).sorted() {
             let exists = NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil
             print("\(exists ? "ok  " : "MISSING") \(name)")
+        }
+    }
+
+    /// Dumps everything a pair of Galaxy Buds sends.
+    ///
+    /// The reason this exists: byte 12 of EXTENDED_STATUS_UPDATED is the one
+    /// offset in the protocol that was inferred from GalaxyBudsClient's
+    /// model-branching parser rather than read off a capture. Connect, watch
+    /// the connect-time frame, then change mode with a touch gesture and check
+    /// that the NOISE_CONTROLS_UPDATE agrees with what byte 12 said.
+    @MainActor
+    static func samsung(_ mac: String?) async throws {
+        let backend = SamsungBackend()
+        backend.start()
+
+        guard let mac else {
+            let devices = backend.connectedDevices()
+            guard !devices.isEmpty else { throw CLIError.message("No paired devices.") }
+            for device in devices {
+                print("\(device.name)  \(device.id.id)\(device.isLikelyMatch ? "  <- likely" : "")")
+            }
+            print("\nrun: budsctl-cli samsung <mac>")
+            return
+        }
+
+        backend.onConnectionChange = { print("[connection] \($0.label)") }
+        let frames = backend.frames()
+        backend.adopt(DeviceRef(backend: SamsungBackend.id, id: mac))
+
+        print("watching. change the mode by tapping a bud or from your phone. Ctrl-C to stop.")
+        for await frame in frames {
+            let name = frame.id.map(String.init(describing:)) ?? "unknown(\(frame.rawID))"
+            let hex = frame.payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+            let time = Date().formatted(date: .omitted, time: .standard)
+            print("[\(time)] \(name) payload=\(hex)")
+
+            // The interpretation this app would act on, so a wrong offset shows
+            // up as a disagreement rather than as silence.
+            let events = frame.events
+            if !events.isEmpty { print("           -> \(events)") }
+            if frame.id == .extendedStatusUpdated, frame.payload.count > 12 {
+                print("           byte[12] = \(frame.payload[12]) "
+                      + "(mode: \(ANCMode(rawValue: frame.payload[12])?.label ?? "out of range"))")
+            }
         }
     }
 }
