@@ -268,6 +268,14 @@ final class AppModel {
         // backend from `bridge.deviceRef` on every access. That removes the
         // class of bug rather than this instance of it, but it is a wider
         // change than this restores.
+        //
+        // Started before it is handed over, so contract 1 holds literally and
+        // not merely by coincidence: the disconnect loop above cancelled this
+        // backend's frame pump, and `use(_:)` calls the *controller's*
+        // `start()`, never the backend's. Nothing observes the difference today
+        // — nothing is adopted after a forget — but an invariant that depends on
+        // no one looking is one refactor from being false.
+        backends[0].start()
         controller.use(backends[0])
 
         bridge.saveDeviceRef(nil)
