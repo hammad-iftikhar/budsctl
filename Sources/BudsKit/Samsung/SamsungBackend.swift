@@ -24,7 +24,6 @@ import IOBluetooth
 public final class SamsungBackend: NSObject, EarbudsBackend {
 
     public static let id = "samsung"
-    public static let displayName = "Samsung"
 
     /// Both empty: the buds push `EXTENDED_STATUS_UPDATED` when the channel
     /// opens and `STATUS_UPDATED` on every battery or wear change. Nothing to

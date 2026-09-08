@@ -111,9 +111,6 @@ public protocol EarbudsBackend: AnyObject {
     /// restart.
     static var id: String { get }
 
-    /// Vendor name, for the Settings section header.
-    static var displayName: String { get }
-
     var onConnectionChange: (@MainActor (ConnectionState) -> Void)? { get set }
     var onDiscoveryUpdate: (@MainActor ([DiscoveredDevice]) -> Void)? { get set }
 

@@ -29,22 +29,6 @@ struct SettingsView: View {
         return model.devices.filter { $0.isLikelyMatch || $0.id == selected }
     }
 
-    /// Grouped by backend so a merged list of two radios still reads as two
-    /// kinds of earbuds.
-    private var groups: [(vendor: String, devices: [DiscoveredDevice])] {
-        Dictionary(grouping: visible) { $0.id.backend }
-            .map { group in
-                (vendor: model.vendorName(group.key),
-                 // Tie-broken on the ref for the same reason `mergeDiscovered`
-                 // is: Swift's sort is not stable, so two same-model pairs
-                 // would otherwise swap rows between updates.
-                 devices: group.value.sorted {
-                     ($0.name, $0.id.persistedForm) < ($1.name, $1.id.persistedForm)
-                 })
-            }
-            .sorted { $0.vendor < $1.vendor }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("EARBUDS")
@@ -60,28 +44,25 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            ForEach(groups, id: \.vendor) { group in
-                if groups.count > 1 {
-                    Text(group.vendor)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                        .padding(.top, 2)
-                }
-                ForEach(group.devices) { device in
-                    Button {
-                        model.select(device)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: device.id == selected
-                                  ? "largecircle.fill.circle" : "circle")
-                                .foregroundStyle(device.id == selected ? Color.accentColor : .secondary)
-                            Text(device.name).lineLimit(1)
-                            Spacer()
-                        }
-                        .contentShape(.rect)
+            // One flat list, deliberately not grouped by vendor. `model.devices`
+            // is already sorted (and tie-broken on the ref, so same-named pairs
+            // cannot swap rows between updates), and `visible` preserves that
+            // order. Two headers over a list that is usually one or two rows
+            // was noise: what the user picks is a pair of earbuds, not a brand.
+            ForEach(visible) { device in
+                Button {
+                    model.select(device)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: device.id == selected
+                              ? "largecircle.fill.circle" : "circle")
+                            .foregroundStyle(device.id == selected ? Color.accentColor : .secondary)
+                        Text(device.name).lineLimit(1)
+                        Spacer()
                     }
-                    .buttonStyle(.plain)
+                    .contentShape(.rect)
                 }
+                .buttonStyle(.plain)
             }
 
             if model.isScanning {

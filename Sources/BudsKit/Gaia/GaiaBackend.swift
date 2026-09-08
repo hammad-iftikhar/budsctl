@@ -14,7 +14,6 @@ import Foundation
 public final class GaiaBackend: EarbudsBackend {
 
     public static let id = "gaia"
-    public static let displayName = "SoundPEATS"
 
     private let transport: any GaiaTransport
     private let client: GaiaClient?

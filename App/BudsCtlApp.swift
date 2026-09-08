@@ -131,14 +131,6 @@ final class AppModel {
         }
     }
 
-    /// Vendor label for a backend id, looked up rather than hardcoded — this is
-    /// what keeps "a new device family is one file plus one line in
-    /// `Backends.all()`" true of the UI as well as the model.
-    func vendorName(_ backendID: String) -> String {
-        guard let backend = backends.first(where: { type(of: $0).id == backendID })
-        else { return backendID }
-        return type(of: backend).displayName
-    }
 
     /// The backend the controller is currently driven by.
     private var activeBackend: any EarbudsBackend {
