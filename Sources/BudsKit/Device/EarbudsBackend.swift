@@ -203,3 +203,22 @@ public final class EventHub: @unchecked Sendable {
         for continuation in targets { continuation.yield(event) }
     }
 }
+
+/// Every device family this app can drive.
+public enum Backends {
+
+    /// **The one list.** Adding a device family is one line here.
+    ///
+    /// All of them are started so both brands show up in Settings; only the one
+    /// owning the user's saved device is adopted.
+    @MainActor
+    public static func all() -> [any EarbudsBackend] {
+        // GaiaBackend needs the client twice over: as its data plane (a
+        // GaiaTransport) and as its connection plane. Same object, two roles.
+        let client = GaiaClient()
+        return [
+            GaiaBackend(transport: client, client: client),
+            SamsungBackend(),
+        ]
+    }
+}

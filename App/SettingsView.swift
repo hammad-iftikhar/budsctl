@@ -16,7 +16,7 @@ struct SettingsView: View {
     // next view update, not synchronously after the write.
     @State private var isSyncingToggle = false
 
-    private var selected: UUID? { model.bridge.peripheralIdentifier }
+    private var selected: DeviceRef? { model.selectedRef }
 
     /// The connected list is shown in full — the service-UUID lookup already
     /// narrows it to a handful of LE audio peripherals, so filtering it further
@@ -27,6 +27,22 @@ struct SettingsView: View {
     private var visible: [DiscoveredDevice] {
         guard model.isScanning, !showAll else { return model.devices }
         return model.devices.filter { $0.isLikelyMatch || $0.id == selected }
+    }
+
+    /// Grouped by backend so a merged list of two radios still reads as two
+    /// kinds of earbuds.
+    private var groups: [(vendor: String, devices: [DiscoveredDevice])] {
+        Dictionary(grouping: visible) { $0.id.backend }
+            .map { (vendor: Self.vendorName($0.key), devices: $0.value.sorted { $0.name < $1.name }) }
+            .sorted { $0.vendor < $1.vendor }
+    }
+
+    private static func vendorName(_ backendID: String) -> String {
+        switch backendID {
+        case GaiaBackend.id: GaiaBackend.displayName
+        case SamsungBackend.id: SamsungBackend.displayName
+        default: backendID
+        }
     }
 
     var body: some View {
@@ -44,20 +60,28 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            ForEach(visible) { device in
-                Button {
-                    model.select(device)
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: device.id == selected
-                              ? "largecircle.fill.circle" : "circle")
-                            .foregroundStyle(device.id == selected ? Color.accentColor : .secondary)
-                        Text(device.name).lineLimit(1)
-                        Spacer()
-                    }
-                    .contentShape(.rect)
+            ForEach(groups, id: \.vendor) { group in
+                if groups.count > 1 {
+                    Text(group.vendor)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 2)
                 }
-                .buttonStyle(.plain)
+                ForEach(group.devices) { device in
+                    Button {
+                        model.select(device)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: device.id == selected
+                                  ? "largecircle.fill.circle" : "circle")
+                                .foregroundStyle(device.id == selected ? Color.accentColor : .secondary)
+                            Text(device.name).lineLimit(1)
+                            Spacer()
+                        }
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
 
             if model.isScanning {

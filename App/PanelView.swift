@@ -42,6 +42,9 @@ struct PanelView: View {
         .padding(14)
         .frame(width: 280)
         .task(id: state.connection) {
+            // Cheap, and it is what fills in the header's device name — the
+            // name now comes from the discovery list, not from a radio.
+            model.refreshDevices()
             // Battery is also refreshed on menu open, per the spec's policy.
             if state.connection.isReady { await model.controller.refreshBattery() }
         }
@@ -49,7 +52,7 @@ struct PanelView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(model.client.deviceName ?? "SoundPEATS Earbuds")
+            Text(model.deviceName ?? "Earbuds")
                 .font(.headline)
             HStack(spacing: 5) {
                 Circle()
