@@ -42,6 +42,18 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
     private var channel: IOBluetoothRFCOMMChannel?
     private var reassembler = SppReassembler()
 
+    /// The current channel's identity and yield target, for `rfcommChannelData`
+    /// to consult without hopping to the main actor — see `DataRoute`'s own
+    /// comment for why a fresh stream is made per channel rather than one for
+    /// this object's whole lifetime.
+    private let dataRoute = DataRoute()
+
+    /// Consumes the current channel's byte stream. Started by
+    /// `startDataPump(for:)` when a channel opens, cancelled in
+    /// `closeChannel()` — it must not outlive the channel whose bytes it is
+    /// reassembling.
+    private var dataPump: Task<Void, Never>?
+
     private var sdpQueryContinuation: CheckedContinuation<Bool, Never>?
 
     /// Distinguishes one SDP query from the next, so a timeout belonging to a
@@ -136,9 +148,50 @@ public final class SamsungBackend: NSObject, EarbudsBackend {
         channel.setDelegate(nil)
         channel.close()
         self.channel = nil
+        // Both cleared: `dataRoute.value = nil` alone already stops
+        // `rfcommChannelData` yielding into this channel's continuation, but
+        // dropping the pump too means neither one keeps a reference to a
+        // channel this backend has already left.
+        dataPump?.cancel()
+        dataPump = nil
+        dataRoute.value = nil
         reassembler = SppReassembler()
         // Nothing else to unwind: `send` is synchronous, so there is never a
         // write in flight across a suspension for this to have to fail.
+    }
+
+    /// Starts consuming the just-opened channel's bytes.
+    ///
+    /// A fresh `AsyncStream`/`Continuation` pair, not the one shared stream a
+    /// first draft of this fix reused across every channel this backend ever
+    /// opens: `AsyncStream` terminates for good the moment the task consuming
+    /// it is cancelled — documented on `Continuation.onTermination`, "invoked
+    /// ... if the task calling `next()` is cancelled" — and a second consumer
+    /// attached afterward gets nothing back, not even values already yielded
+    /// and buffered. Reusing one stream across a reconnect would silently
+    /// drop every chunk from the second connection onward; confirmed with a
+    /// standalone repro before writing this rather than assumed. A fresh pair
+    /// per channel sidesteps the whole hazard: nothing is ever asked to
+    /// out-live the one consumer it was made for.
+    private func startDataPump(for channel: IOBluetoothRFCOMMChannel) {
+        dataPump?.cancel()
+        let (chunks, continuation) = AsyncStream<Data>.makeStream()
+        dataRoute.value = DataRoute.Target(identifier: ObjectIdentifier(channel), continuation: continuation)
+        // Same shape as `GaiaBackend`'s pump and `DeviceController`'s event
+        // loop: `!Task.isCancelled` checked first, because `AsyncStream`
+        // does not itself observe cancellation for an element already
+        // buffered before `closeChannel()` cancels this task — that chunk
+        // would otherwise still resume the loop and reach the reassembler
+        // for a channel this backend has already left.
+        dataPump = Task { [weak self] in
+            for await chunk in chunks {
+                guard let self, !Task.isCancelled else { return }
+                for frame in self.reassembler.append(chunk) {
+                    self.frameHub.yield(frame)
+                    for event in frame.events { self.hub.yield(event) }
+                }
+            }
+        }
     }
 
     private func report(_ state: ConnectionState) {
@@ -546,12 +599,17 @@ public enum SamsungError: Error, Equatable {
 /// (see `deviceConnected` above). Absent a documented guarantee, and with one
 /// sibling API in this same header already proven to violate the assumption,
 /// all four are treated as arriving off-main: `nonisolated`, extract what's
-/// `Sendable`, hop. `IOBluetoothRFCOMMChannel` and `IOBluetoothDevice` are not
-/// `Sendable` and must not cross — the identity check that used to compare the
-/// delegate call's channel against `self.channel` now compares
-/// `ObjectIdentifier`s (a `Sendable` value) instead of the channel references
-/// themselves, and every actual channel operation runs against `self.channel`
-/// on the main actor, never against the parameter that arrived with the call.
+/// `Sendable`, then either hop or hand off. `IOBluetoothRFCOMMChannel` and
+/// `IOBluetoothDevice` are not `Sendable` and must not cross — the identity
+/// check that used to compare the delegate call's channel against
+/// `self.channel` now compares `ObjectIdentifier`s (a `Sendable` value)
+/// instead of the channel references themselves, and every actual channel
+/// operation runs against `self.channel` on the main actor, never against the
+/// parameter that arrived with the call.
+///
+/// `rfcommChannelData` is the one exception to "hop with a `Task`": see its
+/// own doc comment and `DataRoute` for why a stateful byte-stream parser
+/// needs `AsyncStream`'s ordering guarantee instead.
 extension SamsungBackend: IOBluetoothRFCOMMChannelDelegate {
 
     public nonisolated func rfcommChannelOpenComplete(
@@ -574,6 +632,7 @@ extension SamsungBackend: IOBluetoothRFCOMMChannelDelegate {
                 return
             }
             self.openAttempt = 0
+            self.startDataPump(for: channel)
             self.report(.ready)
             // Announce ourselves, the way the reference implementation does on
             // connect. The buds push EXTENDED_STATUS_UPDATED without being asked,
@@ -582,23 +641,23 @@ extension SamsungBackend: IOBluetoothRFCOMMChannelDelegate {
         }
     }
 
+    /// No `Task` here, unlike the other three callbacks in this file — see
+    /// `DataRoute` and `startDataPump(for:)` for why. `AsyncStream.yield` is
+    /// documented to preserve the order chunks are yielded in and to be safe
+    /// to call from any thread, which an unstructured `Task` per chunk is
+    /// not; a stateful byte-stream reassembler is precisely where that
+    /// distinction is load-bearing rather than academic.
     public nonisolated func rfcommChannelData(
         _ rfcommChannel: IOBluetoothRFCOMMChannel!,
         data dataPointer: UnsafeMutableRawPointer!,
         length dataLength: Int
     ) {
         guard let rfcommChannel, let dataPointer, dataLength > 0 else { return }
-        let identifier = ObjectIdentifier(rfcommChannel)
-        // Copied into a `Sendable` buffer before the hop — the raw pointer is
+        guard let target = dataRoute.value, target.identifier == ObjectIdentifier(rfcommChannel) else { return }
+        // Copied into a `Sendable` buffer immediately — the raw pointer is
         // only valid for the duration of this callback.
         let chunk = Data(bytes: dataPointer, count: dataLength)
-        Task { @MainActor [weak self] in
-            guard let self, let channel = self.channel, ObjectIdentifier(channel) == identifier else { return }
-            for frame in self.reassembler.append(chunk) {
-                self.frameHub.yield(frame)
-                for event in frame.events { self.hub.yield(event) }
-            }
-        }
+        target.continuation.yield(chunk)
     }
 
     public nonisolated func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
@@ -629,6 +688,32 @@ extension SamsungBackend {
             guard let self else { return }
             self.resumeSDPQuery(succeeded, generation: self.sdpGeneration)
         }
+    }
+}
+
+/// The channel `rfcommChannelData` should currently trust, and where to yield
+/// its bytes — read from whatever queue IOBluetooth calls that method back
+/// on, written from the main actor whenever a channel opens or closes.
+///
+/// Same shape as `SppFrameHub`/`EventHub` below: a small `@unchecked Sendable`
+/// box around an `NSLock`. Holds an `ObjectIdentifier` rather than the
+/// channel itself because `IOBluetoothRFCOMMChannel` is not `Sendable` and
+/// must not cross into `rfcommChannelData`'s nonisolated context from the
+/// main actor that sets this value; it holds the `Continuation` itself
+/// because that type *is* `Sendable`, so the value can be read and used
+/// directly without a hop back to the main actor for every chunk.
+final class DataRoute: @unchecked Sendable {
+    struct Target {
+        let identifier: ObjectIdentifier
+        let continuation: AsyncStream<Data>.Continuation
+    }
+
+    private let lock = NSLock()
+    private var target: Target?
+
+    var value: Target? {
+        get { lock.withLock { target } }
+        set { lock.withLock { target = newValue } }
     }
 }
 
