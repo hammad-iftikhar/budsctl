@@ -146,6 +146,18 @@ public final class DeviceController {
             // is the least trustworthy one we ever take (see `settleMode`), so
             // its loader stays owned by the settle sequence and must not be
             // cleared here.
+            //
+            // Depends on an ordering worth naming here, because the fix and the
+            // failure would be far apart: this is the *only* thing that lowers
+            // the loader for a pushing backend, so a `.mode` arriving before
+            // `connectionChanged(.ready)` raised it would leave the picker
+            // disabled for the whole connection. It cannot arrive first. RFCOMM
+            // delivers no data before the channel reports open, and IOBluetooth
+            // serializes `rfcommChannelOpenComplete` and `rfcommChannelData` on
+            // one queue — so the task carrying `.ready` to the main actor, and
+            // the `connectionChanged` it spawns, are enqueued strictly before
+            // any data frame's job. A backend that pushes its state over some
+            // other transport must preserve that ordering or own its loader.
             if backend.policy.settleReads.isEmpty { clearResolving() }
             publish()
 
