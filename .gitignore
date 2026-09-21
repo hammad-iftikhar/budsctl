@@ -9,3 +9,4 @@ Controls/Info.plist
 
 # Release artifacts
 *.dmg
+.vscode/launch.json

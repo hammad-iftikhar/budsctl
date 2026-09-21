@@ -195,6 +195,17 @@ public final class GaiaClient: NSObject, GaiaTransport {
             report(.notConfigured)
             return
         }
+        // The radio is not usable until it powers on, and `retrievePeripherals`
+        // returns nothing before then — indistinguishable from a dead
+        // identifier, but the wrong conclusion to draw. `adopted` must survive,
+        // because `centralManagerDidUpdateState` re-drives this and does so
+        // only while it is set. Clearing it here meant a cold launch with the
+        // buds already connected sat at `.notConfigured` until the user clicked
+        // the device that Settings was already showing as selected.
+        guard central.state == .poweredOn else {
+            report(.waiting)
+            return
+        }
         let known = central.retrievePeripherals(withIdentifiers: [identifier])
         guard let found = known.first else {
             // The identifier is dead — the user re-paired. Do not spin on it.

@@ -11,13 +11,25 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
-            if state.connection == .notConfigured {
-                Text("Choose your earbuds in Settings, below.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
+            // The controls are always in the layout, even with nothing chosen
+            // and nothing connected — the prompt covers them rather than
+            // replacing them. Swapping a one-line prompt for this block
+            // changed the panel's height by 59pt on every connect, and macOS
+            // 26+ animates the MenuBarExtra resize, so waking an idle link by
+            // changing mode stretched the panel open while it read the mode
+            // back. Height now depends only on whether Settings is expanded.
+            VStack(alignment: .leading, spacing: 12) {
                 modePicker
                 batteryRow
+            }
+            .opacity(state.connection == .notConfigured ? 0 : 1)
+            .accessibilityHidden(state.connection == .notConfigured)
+            .overlay(alignment: .topLeading) {
+                if state.connection == .notConfigured {
+                    Text("Choose your earbuds in Settings, below.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if state.connection == .bluetoothOff {
@@ -40,7 +52,17 @@ struct PanelView: View {
             footer
         }
         .padding(14)
-        .frame(width: 280)
+        // 327, not 280, and the number is derived rather than taste: the
+        // segmented mode picker is an AppKit control reporting a 298.5pt
+        // intrinsic width ("Transparency" is the widest segment and all three
+        // size to the widest). On every state update the control snaps to that
+        // intrinsic width regardless of what SwiftUI laid out, so any panel
+        // that gives it less made the whole row jump outside the panel and
+        // back — 23pt each side at 280, still 14pt when sized automatically.
+        // 327 = 298.5 + the 14pt padding on each side, so the width it is
+        // given already equals the width it snaps to and nothing moves.
+        // Shortening that label is what buys a narrower panel back.
+        .frame(width: 327)
         .task(id: state.connection) {
             // Cheap, and it is what fills in the header's device name — the
             // name now comes from the discovery list, not from a radio.
@@ -90,17 +112,19 @@ struct PanelView: View {
             // clicked would invite setting the mode you are already in.
             .disabled(!state.connection.isReady || state.isResolvingMode)
 
-            if state.isBusy {
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.small)
-                    Text("Applying…").font(.caption).foregroundStyle(.secondary)
-                }
-            } else if state.isResolvingMode {
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.small)
-                    Text("Reading mode…").font(.caption).foregroundStyle(.secondary)
-                }
+            // Always laid out, only faded. Inserting this row grew the picker
+            // block from 24pt to 47pt, and macOS 26+ animates the resulting
+            // MenuBarExtra window resize — so every mode change stretched the
+            // panel open and snapped it shut again. Reserving the row's height
+            // costs 23pt of blank space and makes the panel's height constant.
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.small)
+                Text(state.isBusy ? "Applying…" : "Reading mode…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
+            .opacity(state.isBusy || state.isResolvingMode ? 1 : 0)
+            .accessibilityHidden(!(state.isBusy || state.isResolvingMode))
         }
     }
 
