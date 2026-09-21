@@ -192,11 +192,16 @@ final class AppModel {
     func stopScan() {
         isScanning = false
         for backend in backends { backend.stopScan() }
+        // `devices` still holds the scan's raw hits — every TV and phone in the
+        // room — and `SettingsView.visible` only applies its name filter while
+        // `isScanning` is true. Leaving them in until the next connection
+        // transition refreshed the list showed the whole beacon list for a few
+        // frames, which stretched the panel and snapped it back.
+        refreshDevices()
     }
 
     func select(_ device: DiscoveredDevice) {
-        isScanning = false
-        for backend in backends { backend.stopScan() }
+        stopScan()
 
         guard let target = backends.first(where: { type(of: $0).id == device.id.backend })
         else { return }
